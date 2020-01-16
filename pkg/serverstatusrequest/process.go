@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,28 +23,36 @@ import (
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/clock"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/buildinfo"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/buildinfo"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/plugin/framework"
 )
 
 const ttl = time.Minute
 
+type PluginLister interface {
+	// List returns all PluginIdentifiers for kind.
+	List(kind framework.PluginKind) []framework.PluginIdentifier
+}
+
 // Process fills out new ServerStatusRequest objects and deletes processed ones
 // that have expired.
-func Process(req *arkv1api.ServerStatusRequest, client arkv1client.ServerStatusRequestsGetter, clock clock.Clock, log logrus.FieldLogger) error {
+func Process(req *velerov1api.ServerStatusRequest, client velerov1client.ServerStatusRequestsGetter, pluginLister PluginLister, clock clock.Clock, log logrus.FieldLogger) error {
 	switch req.Status.Phase {
-	case "", arkv1api.ServerStatusRequestPhaseNew:
+	case "", velerov1api.ServerStatusRequestPhaseNew:
 		log.Info("Processing new ServerStatusRequest")
-		return errors.WithStack(patch(client, req, func(req *arkv1api.ServerStatusRequest) {
+		return errors.WithStack(patch(client, req, func(req *velerov1api.ServerStatusRequest) {
 			req.Status.ServerVersion = buildinfo.Version
-			req.Status.ProcessedTimestamp.Time = clock.Now()
-			req.Status.Phase = arkv1api.ServerStatusRequestPhaseProcessed
+			req.Status.ProcessedTimestamp = &metav1.Time{Time: clock.Now()}
+			req.Status.Phase = velerov1api.ServerStatusRequestPhaseProcessed
+			req.Status.Plugins = plugins(pluginLister)
 		}))
-	case arkv1api.ServerStatusRequestPhaseProcessed:
+	case velerov1api.ServerStatusRequestPhaseProcessed:
 		log.Debug("Checking whether ServerStatusRequest has expired")
 		expiration := req.Status.ProcessedTimestamp.Add(ttl)
 		if expiration.After(clock.Now()) {
@@ -63,7 +71,7 @@ func Process(req *arkv1api.ServerStatusRequest, client arkv1client.ServerStatusR
 	}
 }
 
-func patch(client arkv1client.ServerStatusRequestsGetter, req *arkv1api.ServerStatusRequest, updateFunc func(*arkv1api.ServerStatusRequest)) error {
+func patch(client velerov1client.ServerStatusRequestsGetter, req *velerov1api.ServerStatusRequest, updateFunc func(*velerov1api.ServerStatusRequest)) error {
 	originalJSON, err := json.Marshal(req)
 	if err != nil {
 		return errors.WithStack(err)
@@ -87,4 +95,19 @@ func patch(client arkv1client.ServerStatusRequestsGetter, req *arkv1api.ServerSt
 	}
 
 	return nil
+}
+
+func plugins(pluginLister PluginLister) []velerov1api.PluginInfo {
+	var plugins []velerov1api.PluginInfo
+	for _, v := range framework.AllPluginKinds() {
+		list := pluginLister.List(v)
+		for _, plugin := range list {
+			pluginInfo := velerov1api.PluginInfo{
+				Name: plugin.Name,
+				Kind: plugin.Kind.String(),
+			}
+			plugins = append(plugins, pluginInfo)
+		}
+	}
+	return plugins
 }

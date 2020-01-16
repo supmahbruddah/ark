@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -52,10 +52,10 @@ func (c *Command) StringSlice() []string {
 		res = append(res, passwordFlag(c.PasswordFile))
 	}
 
-	// If ARK_SCRATCH_DIR is defined, put the restic cache within it. If not,
+	// If VELERO_SCRATCH_DIR is defined, put the restic cache within it. If not,
 	// allow restic to choose the location. This makes running either in-cluster
 	// or local (dev) work properly.
-	if scratch := os.Getenv("ARK_SCRATCH_DIR"); scratch != "" {
+	if scratch := os.Getenv("VELERO_SCRATCH_DIR"); scratch != "" {
 		res = append(res, cacheDirFlag(filepath.Join(scratch, ".cache", "restic")))
 	}
 

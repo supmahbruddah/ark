@@ -1,6 +1,6 @@
 #!/bin/bash -e
 #
-# Copyright 2018 the Heptio Ark contributors.
+# Copyright 2018, 2019 the Velero contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARK_ROOT=$(dirname ${BASH_SOURCE})/..
-BIN=${ARK_ROOT}/_output/bin
+VELERO_ROOT=$(dirname ${BASH_SOURCE})/..
+BIN=${VELERO_ROOT}/_output/bin
 
 mkdir -p ${BIN}
 
 echo "Updating generated Github issue template"
-go build -o ${BIN}/issue-tmpl-gen ./docs/issue-template-gen/main.go
+go build -o ${BIN}/issue-tmpl-gen ./hack/issue-template-gen/main.go
 
 if [[ $# -gt 1 ]]; then
   echo "usage: ${BASH_SOURCE} [OUTPUT_FILE]"
@@ -29,7 +29,7 @@ fi
 
 OUTPUT_ISSUE_FILE="$1"
 if [[ -z "${OUTPUT_ISSUE_FILE}" ]]; then
-  OUTPUT_ISSUE_FILE=${ARK_ROOT}/.github/ISSUE_TEMPLATE/bug_report.md
+  OUTPUT_ISSUE_FILE=${VELERO_ROOT}/.github/ISSUE_TEMPLATE/bug_report.md
 fi
 
 ${BIN}/issue-tmpl-gen ${OUTPUT_ISSUE_FILE} 

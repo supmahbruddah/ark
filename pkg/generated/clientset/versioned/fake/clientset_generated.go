@@ -1,5 +1,5 @@
 /*
-Copyright the Heptio Ark contributors.
+Copyright the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ limitations under the License.
 package fake
 
 import (
-	clientset "github.com/heptio/ark/pkg/generated/clientset/versioned"
-	arkv1 "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	fakearkv1 "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1/fake"
+	clientset "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
+	velerov1 "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	fakevelerov1 "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1/fake"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
@@ -41,7 +41,7 @@ func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 		}
 	}
 
-	cs := &Clientset{}
+	cs := &Clientset{tracker: o}
 	cs.discovery = &fakediscovery.FakeDiscovery{Fake: &cs.Fake}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
@@ -63,20 +63,20 @@ func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 type Clientset struct {
 	testing.Fake
 	discovery *fakediscovery.FakeDiscovery
+	tracker   testing.ObjectTracker
 }
 
 func (c *Clientset) Discovery() discovery.DiscoveryInterface {
 	return c.discovery
 }
 
-var _ clientset.Interface = &Clientset{}
-
-// ArkV1 retrieves the ArkV1Client
-func (c *Clientset) ArkV1() arkv1.ArkV1Interface {
-	return &fakearkv1.FakeArkV1{Fake: &c.Fake}
+func (c *Clientset) Tracker() testing.ObjectTracker {
+	return c.tracker
 }
 
-// Ark retrieves the ArkV1Client
-func (c *Clientset) Ark() arkv1.ArkV1Interface {
-	return &fakearkv1.FakeArkV1{Fake: &c.Fake}
+var _ clientset.Interface = &Clientset{}
+
+// VeleroV1 retrieves the VeleroV1Client
+func (c *Clientset) VeleroV1() velerov1.VeleroV1Interface {
+	return &fakevelerov1.FakeVeleroV1{Fake: &c.Fake}
 }

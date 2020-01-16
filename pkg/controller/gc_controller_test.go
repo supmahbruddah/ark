@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,11 +32,12 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	core "k8s.io/client-go/testing"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions"
-	"github.com/heptio/ark/pkg/util/kube"
-	arktest "github.com/heptio/ark/pkg/util/test"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/fake"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
+	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 func TestGCControllerEnqueueAllBackups(t *testing.T) {
@@ -45,10 +46,11 @@ func TestGCControllerEnqueueAllBackups(t *testing.T) {
 		sharedInformers = informers.NewSharedInformerFactory(client, 0)
 
 		controller = NewGCController(
-			arktest.NewLogger(),
-			sharedInformers.Ark().V1().Backups(),
-			sharedInformers.Ark().V1().DeleteBackupRequests(),
-			client.ArkV1(),
+			velerotest.NewLogger(),
+			sharedInformers.Velero().V1().Backups(),
+			sharedInformers.Velero().V1().DeleteBackupRequests(),
+			client.VeleroV1(),
+			sharedInformers.Velero().V1().BackupStorageLocations(),
 		).(*gcController)
 	)
 
@@ -65,8 +67,8 @@ func TestGCControllerEnqueueAllBackups(t *testing.T) {
 	var expected []string
 
 	for i := 0; i < 3; i++ {
-		backup := arktest.NewTestBackup().WithName(fmt.Sprintf("backup-%d", i)).Backup
-		sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(backup)
+		backup := builder.ForBackup(api.DefaultNamespace, fmt.Sprintf("backup-%d", i)).Result()
+		sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(backup)
 		expected = append(expected, kube.NamespaceAndName(backup))
 	}
 
@@ -96,7 +98,7 @@ Loop:
 }
 
 func TestGCControllerHasUpdateFunc(t *testing.T) {
-	backup := arktest.NewTestBackup().WithName("backup").Backup
+	backup := defaultBackup().Result()
 	expected := kube.NamespaceAndName(backup)
 
 	client := fake.NewSimpleClientset(backup)
@@ -108,10 +110,11 @@ func TestGCControllerHasUpdateFunc(t *testing.T) {
 	sharedInformers := informers.NewSharedInformerFactory(client, 0)
 
 	controller := NewGCController(
-		arktest.NewLogger(),
-		sharedInformers.Ark().V1().Backups(),
-		sharedInformers.Ark().V1().DeleteBackupRequests(),
-		client.ArkV1(),
+		velerotest.NewLogger(),
+		sharedInformers.Velero().V1().Backups(),
+		sharedInformers.Velero().V1().DeleteBackupRequests(),
+		client.VeleroV1(),
+		sharedInformers.Velero().V1().BackupStorageLocations(),
 	).(*gcController)
 
 	keys := make(chan string)
@@ -149,11 +152,13 @@ func TestGCControllerHasUpdateFunc(t *testing.T) {
 
 func TestGCControllerProcessQueueItem(t *testing.T) {
 	fakeClock := clock.NewFakeClock(time.Now())
+	defaultBackupLocation := builder.ForBackupStorageLocation("velero", "default").Result()
 
 	tests := []struct {
 		name                           string
 		backup                         *api.Backup
 		deleteBackupRequests           []*api.DeleteBackupRequest
+		backupLocation                 *api.BackupStorageLocation
 		expectDeletion                 bool
 		createDeleteBackupRequestError bool
 		expectError                    bool
@@ -162,24 +167,33 @@ func TestGCControllerProcessQueueItem(t *testing.T) {
 			name: "can't find backup - no error",
 		},
 		{
-			name: "unexpired backup is not deleted",
-			backup: arktest.NewTestBackup().WithName("backup-1").
-				WithExpiration(fakeClock.Now().Add(1 * time.Minute)).
-				Backup,
+			name:           "unexpired backup is not deleted",
+			backup:         defaultBackup().Expiration(fakeClock.Now().Add(time.Minute)).StorageLocation("default").Result(),
+			backupLocation: defaultBackupLocation,
 			expectDeletion: false,
 		},
 		{
-			name: "expired backup with no pending deletion requests is deleted",
-			backup: arktest.NewTestBackup().WithName("backup-1").
-				WithExpiration(fakeClock.Now().Add(-1 * time.Second)).
-				Backup,
+			name:           "expired backup in read-only storage location is not deleted",
+			backup:         defaultBackup().Expiration(fakeClock.Now().Add(-time.Minute)).StorageLocation("read-only").Result(),
+			backupLocation: builder.ForBackupStorageLocation("velero", "read-only").AccessMode(api.BackupStorageLocationAccessModeReadOnly).Result(),
+			expectDeletion: false,
+		},
+		{
+			name:           "expired backup in read-write storage location is deleted",
+			backup:         defaultBackup().Expiration(fakeClock.Now().Add(-time.Minute)).StorageLocation("read-write").Result(),
+			backupLocation: builder.ForBackupStorageLocation("velero", "read-write").AccessMode(api.BackupStorageLocationAccessModeReadWrite).Result(),
 			expectDeletion: true,
 		},
 		{
-			name: "expired backup with a pending deletion request is not deleted",
-			backup: arktest.NewTestBackup().WithName("backup-1").
-				WithExpiration(fakeClock.Now().Add(-1 * time.Second)).
-				Backup,
+			name:           "expired backup with no pending deletion requests is deleted",
+			backup:         defaultBackup().Expiration(fakeClock.Now().Add(-time.Second)).StorageLocation("default").Result(),
+			backupLocation: defaultBackupLocation,
+			expectDeletion: true,
+		},
+		{
+			name:           "expired backup with a pending deletion request is not deleted",
+			backup:         defaultBackup().Expiration(fakeClock.Now().Add(-time.Second)).StorageLocation("default").Result(),
+			backupLocation: defaultBackupLocation,
 			deleteBackupRequests: []*api.DeleteBackupRequest{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -198,10 +212,9 @@ func TestGCControllerProcessQueueItem(t *testing.T) {
 			expectDeletion: false,
 		},
 		{
-			name: "expired backup with only processed deletion requests is deleted",
-			backup: arktest.NewTestBackup().WithName("backup-1").
-				WithExpiration(fakeClock.Now().Add(-1 * time.Second)).
-				Backup,
+			name:           "expired backup with only processed deletion requests is deleted",
+			backup:         defaultBackup().Expiration(fakeClock.Now().Add(-time.Second)).StorageLocation("default").Result(),
+			backupLocation: defaultBackupLocation,
 			deleteBackupRequests: []*api.DeleteBackupRequest{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -220,10 +233,9 @@ func TestGCControllerProcessQueueItem(t *testing.T) {
 			expectDeletion: true,
 		},
 		{
-			name: "create DeleteBackupRequest error returns an error",
-			backup: arktest.NewTestBackup().WithName("backup-1").
-				WithExpiration(fakeClock.Now().Add(-1 * time.Second)).
-				Backup,
+			name:                           "create DeleteBackupRequest error returns an error",
+			backup:                         defaultBackup().Expiration(fakeClock.Now().Add(-time.Second)).StorageLocation("default").Result(),
+			backupLocation:                 defaultBackupLocation,
 			expectDeletion:                 true,
 			createDeleteBackupRequestError: true,
 			expectError:                    true,
@@ -238,21 +250,26 @@ func TestGCControllerProcessQueueItem(t *testing.T) {
 			)
 
 			controller := NewGCController(
-				arktest.NewLogger(),
-				sharedInformers.Ark().V1().Backups(),
-				sharedInformers.Ark().V1().DeleteBackupRequests(),
-				client.ArkV1(),
+				velerotest.NewLogger(),
+				sharedInformers.Velero().V1().Backups(),
+				sharedInformers.Velero().V1().DeleteBackupRequests(),
+				client.VeleroV1(),
+				sharedInformers.Velero().V1().BackupStorageLocations(),
 			).(*gcController)
 			controller.clock = fakeClock
 
 			var key string
 			if test.backup != nil {
 				key = kube.NamespaceAndName(test.backup)
-				sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(test.backup)
+				sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(test.backup)
+			}
+
+			if test.backupLocation != nil {
+				sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(test.backupLocation)
 			}
 
 			for _, dbr := range test.deleteBackupRequests {
-				sharedInformers.Ark().V1().DeleteBackupRequests().Informer().GetStore().Add(dbr)
+				sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(dbr)
 			}
 
 			if test.createDeleteBackupRequestError {

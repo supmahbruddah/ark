@@ -1,5 +1,17 @@
+  - [v0.10.2](#v0102)
   - [v0.10.1](#v0101)
   - [v0.10.0](#v0100)
+
+## v0.10.2
+#### 2019-02-28
+
+### Download
+- https://github.com/heptio/ark/releases/tag/v0.10.2
+
+### Changes
+  * upgrade restic to v0.9.4 & replace --hostname flag with --host (#1156, @skriss)
+  * use 'restic stats' instead of 'restic check' to determine if repo exists (#1171, @skriss)
+  * Fix concurrency bug in code ensuring restic repository exists (#1235, @skriss)
 
 ## v0.10.1
 #### 2019-01-10
@@ -245,5 +257,5 @@ need to be updated for v0.10.
 - 	[eabef085](https://github.com/heptio/ark/commit/eabef085)	Update generated Ark code based on the 1.11 k8s.io/code-generator script
 - 	[f5eac0b4](https://github.com/heptio/ark/commit/f5eac0b4)	Update vendored library code for Kubernetes 1.11
 
-[1]: https://github.com/heptio/ark/blob/master/docs/upgrading-to-v0.10.md
+[1]: https://heptio.github.io/velero/v0.10.0/upgrading-to-v0.10
 [2]: locations.md

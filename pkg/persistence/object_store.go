@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,54 +25,67 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/satori/uuid"
 	"github.com/sirupsen/logrus"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/cloudprovider"
-	"github.com/heptio/ark/pkg/generated/clientset/versioned/scheme"
-	"github.com/heptio/ark/pkg/volume"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/scheme"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
+type BackupInfo struct {
+	Name string
+	Metadata,
+	Contents,
+	Log,
+	PodVolumeBackups,
+	VolumeSnapshots,
+	BackupResourceList io.Reader
+}
+
 // BackupStore defines operations for creating, retrieving, and deleting
-// Ark backup and restore data in/from a persistent backup store.
+// Velero backup and restore data in/from a persistent backup store.
 type BackupStore interface {
 	IsValid() error
-	GetRevision() (string, error)
 
 	ListBackups() ([]string, error)
 
-	PutBackup(name string, metadata, contents, log, volumeSnapshots io.Reader) error
-	GetBackupMetadata(name string) (*arkv1api.Backup, error)
+	PutBackup(info BackupInfo) error
+	GetBackupMetadata(name string) (*velerov1api.Backup, error)
 	GetBackupVolumeSnapshots(name string) ([]*volume.Snapshot, error)
+	GetPodVolumeBackups(name string) ([]*velerov1api.PodVolumeBackup, error)
 	GetBackupContents(name string) (io.ReadCloser, error)
+
+	// BackupExists checks if the backup metadata file exists in object storage.
+	BackupExists(bucket, backupName string) (bool, error)
+
 	DeleteBackup(name string) error
 
 	PutRestoreLog(backup, restore string, log io.Reader) error
 	PutRestoreResults(backup, restore string, results io.Reader) error
 	DeleteRestore(name string) error
 
-	GetDownloadURL(target arkv1api.DownloadTarget) (string, error)
+	GetDownloadURL(target velerov1api.DownloadTarget) (string, error)
 }
 
 // DownloadURLTTL is how long a download URL is valid for.
 const DownloadURLTTL = 10 * time.Minute
 
 type objectBackupStore struct {
-	objectStore cloudprovider.ObjectStore
+	objectStore velero.ObjectStore
 	bucket      string
 	layout      *ObjectStoreLayout
 	logger      logrus.FieldLogger
 }
 
-// ObjectStoreGetter is a type that can get a cloudprovider.ObjectStore
+// ObjectStoreGetter is a type that can get a velero.ObjectStore
 // from a provider name.
 type ObjectStoreGetter interface {
-	GetObjectStore(provider string) (cloudprovider.ObjectStore, error)
+	GetObjectStore(provider string) (velero.ObjectStore, error)
 }
 
-func NewObjectBackupStore(location *arkv1api.BackupStorageLocation, objectStoreGetter ObjectStoreGetter, logger logrus.FieldLogger) (BackupStore, error) {
+func NewObjectBackupStore(location *velerov1api.BackupStorageLocation, objectStoreGetter ObjectStoreGetter, logger logrus.FieldLogger) (BackupStore, error) {
 	if location.Spec.ObjectStorage == nil {
 		return nil, errors.New("backup storage location does not use object storage")
 	}
@@ -81,19 +94,31 @@ func NewObjectBackupStore(location *arkv1api.BackupStorageLocation, objectStoreG
 		return nil, errors.New("object storage provider name must not be empty")
 	}
 
-	objectStore, err := objectStoreGetter.GetObjectStore(location.Spec.Provider)
-	if err != nil {
-		return nil, err
+	// trim off any leading/trailing slashes
+	bucket := strings.Trim(location.Spec.ObjectStorage.Bucket, "/")
+	prefix := strings.Trim(location.Spec.ObjectStorage.Prefix, "/")
+
+	// if there are any slashes in the middle of 'bucket', the user
+	// probably put <bucket>/<prefix> in the bucket field, which we
+	// don't support.
+	if strings.Contains(bucket, "/") {
+		return nil, errors.Errorf("backup storage location's bucket name %q must not contain a '/' (if using a prefix, put it in the 'Prefix' field instead)", location.Spec.ObjectStorage.Bucket)
 	}
 
-	// add the bucket name to the config map so that object stores can use
-	// it when initializing. The AWS object store uses this to determine the
-	// bucket's region when setting up its client.
+	// add the bucket name and prefix to the config map so that object stores
+	// can use them when initializing. The AWS object store uses the bucket
+	// name to determine the bucket's region when setting up its client.
 	if location.Spec.ObjectStorage != nil {
 		if location.Spec.Config == nil {
 			location.Spec.Config = make(map[string]string)
 		}
-		location.Spec.Config["bucket"] = location.Spec.ObjectStorage.Bucket
+		location.Spec.Config["bucket"] = bucket
+		location.Spec.Config["prefix"] = prefix
+	}
+
+	objectStore, err := objectStoreGetter.GetObjectStore(location.Spec.Provider)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := objectStore.Init(location.Spec.Config); err != nil {
@@ -101,14 +126,14 @@ func NewObjectBackupStore(location *arkv1api.BackupStorageLocation, objectStoreG
 	}
 
 	log := logger.WithFields(logrus.Fields(map[string]interface{}{
-		"bucket": location.Spec.ObjectStorage.Bucket,
-		"prefix": location.Spec.ObjectStorage.Prefix,
+		"bucket": bucket,
+		"prefix": prefix,
 	}))
 
 	return &objectBackupStore{
 		objectStore: objectStore,
-		bucket:      location.Spec.ObjectStorage.Bucket,
-		layout:      NewObjectStoreLayout(location.Spec.ObjectStorage.Prefix),
+		bucket:      bucket,
+		layout:      NewObjectStoreLayout(prefix),
 		logger:      log,
 	}, nil
 }
@@ -150,7 +175,7 @@ func (s *objectBackupStore) ListBackups() ([]string, error) {
 	output := make([]string, 0, len(prefixes))
 
 	for _, prefix := range prefixes {
-		// values returned from a call to cloudprovider.ObjectStore's
+		// values returned from a call to ObjectStore's
 		// ListCommonPrefixes method return the *full* prefix, inclusive
 		// of s.backupsPrefix, and include the delimiter ("/") as a suffix. Trim
 		// each of those off to get the backup name.
@@ -162,53 +187,73 @@ func (s *objectBackupStore) ListBackups() ([]string, error) {
 	return output, nil
 }
 
-func (s *objectBackupStore) PutBackup(name string, metadata, contents, log, volumeSnapshots io.Reader) error {
-	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupLogKey(name), log); err != nil {
+func (s *objectBackupStore) PutBackup(info BackupInfo) error {
+	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupLogKey(info.Name), info.Log); err != nil {
 		// Uploading the log file is best-effort; if it fails, we log the error but it doesn't impact the
 		// backup's status.
-		s.logger.WithError(err).WithField("backup", name).Error("Error uploading log file")
+		s.logger.WithError(err).WithField("backup", info.Name).Error("Error uploading log file")
 	}
 
-	if metadata == nil {
+	if info.Metadata == nil {
 		// If we don't have metadata, something failed, and there's no point in continuing. An object
 		// storage bucket that is missing the metadata file can't be restored, nor can its logs be
 		// viewed.
 		return nil
 	}
 
-	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupMetadataKey(name), metadata); err != nil {
+	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupMetadataKey(info.Name), info.Metadata); err != nil {
 		// failure to upload metadata file is a hard-stop
 		return err
 	}
 
-	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupContentsKey(name), contents); err != nil {
-		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(name))
+	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupContentsKey(info.Name), info.Contents); err != nil {
+		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(info.Name))
 		return kerrors.NewAggregate([]error{err, deleteErr})
 	}
 
-	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupVolumeSnapshotsKey(name), volumeSnapshots); err != nil {
+	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getPodVolumeBackupsKey(info.Name), info.PodVolumeBackups); err != nil {
 		errs := []error{err}
 
-		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupContentsKey(name))
+		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupContentsKey(info.Name))
 		errs = append(errs, deleteErr)
 
-		deleteErr = s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(name))
+		deleteErr = s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(info.Name))
 		errs = append(errs, deleteErr)
 
 		return kerrors.NewAggregate(errs)
 	}
 
-	if err := s.putRevision(); err != nil {
-		s.logger.WithField("backup", name).WithError(err).Warn("Error updating backup store revision")
+	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupVolumeSnapshotsKey(info.Name), info.VolumeSnapshots); err != nil {
+		errs := []error{err}
+
+		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupContentsKey(info.Name))
+		errs = append(errs, deleteErr)
+
+		deleteErr = s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(info.Name))
+		errs = append(errs, deleteErr)
+
+		return kerrors.NewAggregate(errs)
+	}
+
+	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupResourceListKey(info.Name), info.BackupResourceList); err != nil {
+		errs := []error{err}
+
+		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupContentsKey(info.Name))
+		errs = append(errs, deleteErr)
+
+		deleteErr = s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(info.Name))
+		errs = append(errs, deleteErr)
+
+		return kerrors.NewAggregate(errs)
 	}
 
 	return nil
 }
 
-func (s *objectBackupStore) GetBackupMetadata(name string) (*arkv1api.Backup, error) {
-	key := s.layout.getBackupMetadataKey(name)
+func (s *objectBackupStore) GetBackupMetadata(name string) (*velerov1api.Backup, error) {
+	metadataKey := s.layout.getBackupMetadataKey(name)
 
-	res, err := s.objectStore.GetObject(s.bucket, key)
+	res, err := s.objectStore.GetObject(s.bucket, metadataKey)
 	if err != nil {
 		return nil, err
 	}
@@ -219,73 +264,98 @@ func (s *objectBackupStore) GetBackupMetadata(name string) (*arkv1api.Backup, er
 		return nil, errors.WithStack(err)
 	}
 
-	decoder := scheme.Codecs.UniversalDecoder(arkv1api.SchemeGroupVersion)
+	decoder := scheme.Codecs.UniversalDecoder(velerov1api.SchemeGroupVersion)
 	obj, _, err := decoder.Decode(data, nil, nil)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	backupObj, ok := obj.(*arkv1api.Backup)
+	backupObj, ok := obj.(*velerov1api.Backup)
 	if !ok {
-		return nil, errors.Errorf("unexpected type for %s/%s: %T", s.bucket, key, obj)
+		return nil, errors.Errorf("unexpected type for %s/%s: %T", s.bucket, metadataKey, obj)
 	}
 
 	return backupObj, nil
 }
 
-func keyExists(objectStore cloudprovider.ObjectStore, bucket, prefix, key string) (bool, error) {
-	keys, err := objectStore.ListObjects(bucket, prefix)
-	if err != nil {
-		return false, err
-	}
-
-	var found bool
-	for _, existing := range keys {
-		if key == existing {
-			found = true
-			break
-		}
-	}
-
-	return found, nil
-}
-
 func (s *objectBackupStore) GetBackupVolumeSnapshots(name string) ([]*volume.Snapshot, error) {
-	key := s.layout.getBackupVolumeSnapshotsKey(name)
-
 	// if the volumesnapshots file doesn't exist, we don't want to return an error, since
 	// a legacy backup or a backup with no snapshots would not have this file, so check for
 	// its existence before attempting to get its contents.
-	ok, err := keyExists(s.objectStore, s.bucket, s.layout.getBackupDir(name), key)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if !ok {
-		return nil, nil
-	}
-
-	res, err := s.objectStore.GetObject(s.bucket, key)
+	res, err := tryGet(s.objectStore, s.bucket, s.layout.getBackupVolumeSnapshotsKey(name))
 	if err != nil {
 		return nil, err
 	}
+	if res == nil {
+		return nil, nil
+	}
 	defer res.Close()
 
-	gzr, err := gzip.NewReader(res)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	defer gzr.Close()
-
 	var volumeSnapshots []*volume.Snapshot
-	if err := json.NewDecoder(gzr).Decode(&volumeSnapshots); err != nil {
-		return nil, errors.Wrap(err, "error decoding object data")
+	if err := decode(res, &volumeSnapshots); err != nil {
+		return nil, err
 	}
 
 	return volumeSnapshots, nil
 }
 
+// tryGet returns the object with the given key if it exists, nil if it does not exist,
+// or an error if it was unable to check existence or get the object.
+func tryGet(objectStore velero.ObjectStore, bucket, key string) (io.ReadCloser, error) {
+	exists, err := objectStore.ObjectExists(bucket, key)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, nil
+	}
+
+	return objectStore.GetObject(bucket, key)
+}
+
+// decode extracts a .json.gz file reader into the object pointed to
+// by 'into'.
+func decode(jsongzReader io.Reader, into interface{}) error {
+	gzr, err := gzip.NewReader(jsongzReader)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer gzr.Close()
+
+	if err := json.NewDecoder(gzr).Decode(into); err != nil {
+		return errors.Wrap(err, "error decoding object data")
+	}
+
+	return nil
+}
+
+func (s *objectBackupStore) GetPodVolumeBackups(name string) ([]*velerov1api.PodVolumeBackup, error) {
+	// if the podvolumebackups file doesn't exist, we don't want to return an error, since
+	// a legacy backup or a backup with no pod volume backups would not have this file, so
+	// check for its existence before attempting to get its contents.
+	res, err := tryGet(s.objectStore, s.bucket, s.layout.getPodVolumeBackupsKey(name))
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+	defer res.Close()
+
+	var podVolumeBackups []*velerov1api.PodVolumeBackup
+	if err := decode(res, &podVolumeBackups); err != nil {
+		return nil, err
+	}
+
+	return podVolumeBackups, nil
+}
+
 func (s *objectBackupStore) GetBackupContents(name string) (io.ReadCloser, error) {
 	return s.objectStore.GetObject(s.bucket, s.layout.getBackupContentsKey(name))
+}
+
+func (s *objectBackupStore) BackupExists(bucket, backupName string) (bool, error) {
+	return s.objectStore.ObjectExists(bucket, s.layout.getBackupMetadataKey(backupName))
 }
 
 func (s *objectBackupStore) DeleteBackup(name string) error {
@@ -302,10 +372,6 @@ func (s *objectBackupStore) DeleteBackup(name string) error {
 		if err := s.objectStore.DeleteObject(s.bucket, key); err != nil {
 			errs = append(errs, err)
 		}
-	}
-
-	if err := s.putRevision(); err != nil {
-		s.logger.WithField("backup", name).WithError(err).Warn("Error updating backup store revision")
 	}
 
 	return errors.WithStack(kerrors.NewAggregate(errs))
@@ -327,10 +393,6 @@ func (s *objectBackupStore) DeleteRestore(name string) error {
 		}
 	}
 
-	if err = s.putRevision(); err != nil {
-		errs = append(errs, err)
-	}
-
 	return errors.WithStack(kerrors.NewAggregate(errs))
 }
 
@@ -342,45 +404,23 @@ func (s *objectBackupStore) PutRestoreResults(backup string, restore string, res
 	return s.objectStore.PutObject(s.bucket, s.layout.getRestoreResultsKey(restore), results)
 }
 
-func (s *objectBackupStore) GetDownloadURL(target arkv1api.DownloadTarget) (string, error) {
+func (s *objectBackupStore) GetDownloadURL(target velerov1api.DownloadTarget) (string, error) {
 	switch target.Kind {
-	case arkv1api.DownloadTargetKindBackupContents:
+	case velerov1api.DownloadTargetKindBackupContents:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupContentsKey(target.Name), DownloadURLTTL)
-	case arkv1api.DownloadTargetKindBackupLog:
+	case velerov1api.DownloadTargetKindBackupLog:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupLogKey(target.Name), DownloadURLTTL)
-	case arkv1api.DownloadTargetKindBackupVolumeSnapshots:
+	case velerov1api.DownloadTargetKindBackupVolumeSnapshots:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupVolumeSnapshotsKey(target.Name), DownloadURLTTL)
-	case arkv1api.DownloadTargetKindRestoreLog:
+	case velerov1api.DownloadTargetKindBackupResourceList:
+		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupResourceListKey(target.Name), DownloadURLTTL)
+	case velerov1api.DownloadTargetKindRestoreLog:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getRestoreLogKey(target.Name), DownloadURLTTL)
-	case arkv1api.DownloadTargetKindRestoreResults:
+	case velerov1api.DownloadTargetKindRestoreResults:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getRestoreResultsKey(target.Name), DownloadURLTTL)
 	default:
 		return "", errors.Errorf("unsupported download target kind %q", target.Kind)
 	}
-}
-
-func (s *objectBackupStore) GetRevision() (string, error) {
-	rdr, err := s.objectStore.GetObject(s.bucket, s.layout.getRevisionKey())
-	if err != nil {
-		return "", err
-	}
-
-	bytes, err := ioutil.ReadAll(rdr)
-	if err != nil {
-		return "", errors.Wrap(err, "error reading contents of revision file")
-	}
-
-	return string(bytes), nil
-}
-
-func (s *objectBackupStore) putRevision() error {
-	rdr := strings.NewReader(uuid.NewV4().String())
-
-	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getRevisionKey(), rdr); err != nil {
-		return errors.Wrap(err, "error updating revision file")
-	}
-
-	return nil
 }
 
 func seekToBeginning(r io.Reader) error {
@@ -393,7 +433,7 @@ func seekToBeginning(r io.Reader) error {
 	return err
 }
 
-func seekAndPutObject(objectStore cloudprovider.ObjectStore, bucket, key string, file io.Reader) error {
+func seekAndPutObject(objectStore velero.ObjectStore, bucket, key string, file io.Reader) error {
 	if file == nil {
 		return nil
 	}

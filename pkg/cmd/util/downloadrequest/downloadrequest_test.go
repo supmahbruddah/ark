@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,8 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	core "k8s.io/client-go/testing"
 
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/fake"
 )
 
 func TestStream(t *testing.T) {
@@ -151,7 +151,7 @@ func TestStream(t *testing.T) {
 			output := new(bytes.Buffer)
 			errCh := make(chan error)
 			go func() {
-				err := Stream(client.ArkV1(), "namespace", "name", test.kind, output, timeout)
+				err := Stream(client.VeleroV1(), "namespace", "name", test.kind, output, timeout, false)
 				errCh <- err
 			}()
 

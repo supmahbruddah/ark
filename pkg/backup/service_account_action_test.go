@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,8 +28,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	"github.com/heptio/ark/pkg/kuberesource"
-	arktest "github.com/heptio/ark/pkg/util/test"
+	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
 func newV1ClusterRoleBindingList(rbacCRBList []rbac.ClusterRoleBinding) []ClusterRoleBinding {
@@ -77,12 +78,12 @@ func (f FakeV1beta1ClusterRoleBindingLister) List() ([]ClusterRoleBinding, error
 func TestServiceAccountActionAppliesTo(t *testing.T) {
 	// Instantiating the struct directly since using
 	// NewServiceAccountAction requires a full kubernetes clientset
-	a := &serviceAccountAction{}
+	a := &ServiceAccountAction{}
 
 	actual, err := a.AppliesTo()
 	require.NoError(t, err)
 
-	expected := ResourceSelector{
+	expected := velero.ResourceSelector{
 		IncludedResources: []string{"serviceaccounts"},
 	}
 	assert.Equal(t, expected, actual)
@@ -141,8 +142,8 @@ func TestNewServiceAccountAction(t *testing.T) {
 		},
 	}
 	// Set up all of our fakes outside the test loop
-	discoveryHelper := arktest.FakeDiscoveryHelper{}
-	logger := arktest.NewLogger()
+	discoveryHelper := velerotest.FakeDiscoveryHelper{}
+	logger := velerotest.NewLogger()
 
 	v1crbs := []rbac.ClusterRoleBinding{
 		{
@@ -189,9 +190,7 @@ func TestNewServiceAccountAction(t *testing.T) {
 			}
 			action, err := NewServiceAccountAction(logger, clusterRoleBindingListers, &discoveryHelper)
 			require.NoError(t, err)
-			saAction, ok := action.(*serviceAccountAction)
-			require.True(t, ok)
-			assert.Equal(t, test.expectedCRBs, saAction.clusterRoleBindings)
+			assert.Equal(t, test.expectedCRBs, action.clusterRoleBindings)
 		})
 	}
 }
@@ -201,17 +200,17 @@ func TestServiceAccountActionExecute(t *testing.T) {
 		name                    string
 		serviceAccount          runtime.Unstructured
 		crbs                    []rbac.ClusterRoleBinding
-		expectedAdditionalItems []ResourceIdentifier
+		expectedAdditionalItems []velero.ResourceIdentifier
 	}{
 		{
 			name: "no crbs",
-			serviceAccount: arktest.UnstructuredOrDie(`
+			serviceAccount: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "ServiceAccount",
 				"metadata": {
-					"namespace": "heptio-ark",
-					"name": "ark"
+					"namespace": "velero",
+					"name": "velero"
 				}
 			}
 			`),
@@ -220,13 +219,13 @@ func TestServiceAccountActionExecute(t *testing.T) {
 		},
 		{
 			name: "no matching crbs",
-			serviceAccount: arktest.UnstructuredOrDie(`
+			serviceAccount: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "ServiceAccount",
 				"metadata": {
-					"namespace": "heptio-ark",
-					"name": "ark"
+					"namespace": "velero",
+					"name": "velero"
 				}
 			}
 			`),
@@ -240,17 +239,17 @@ func TestServiceAccountActionExecute(t *testing.T) {
 						},
 						{
 							Kind:      "non-matching-kind",
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 						{
 							Kind:      rbac.ServiceAccountKind,
 							Namespace: "non-matching-ns",
-							Name:      "ark",
+							Name:      "velero",
 						},
 						{
 							Kind:      rbac.ServiceAccountKind,
-							Namespace: "heptio-ark",
+							Namespace: "velero",
 							Name:      "non-matching-name",
 						},
 					},
@@ -263,13 +262,13 @@ func TestServiceAccountActionExecute(t *testing.T) {
 		},
 		{
 			name: "some matching crbs",
-			serviceAccount: arktest.UnstructuredOrDie(`
+			serviceAccount: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "ServiceAccount",
 				"metadata": {
-					"namespace": "heptio-ark",
-					"name": "ark"
+					"namespace": "velero",
+					"name": "velero"
 				}
 			}
 			`),
@@ -301,8 +300,8 @@ func TestServiceAccountActionExecute(t *testing.T) {
 						},
 						{
 							Kind:      rbac.ServiceAccountKind,
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 					},
 					RoleRef: rbac.RoleRef{
@@ -316,8 +315,8 @@ func TestServiceAccountActionExecute(t *testing.T) {
 					Subjects: []rbac.Subject{
 						{
 							Kind:      rbac.ServiceAccountKind,
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 					},
 					RoleRef: rbac.RoleRef{
@@ -331,8 +330,8 @@ func TestServiceAccountActionExecute(t *testing.T) {
 					Subjects: []rbac.Subject{
 						{
 							Kind:      rbac.ServiceAccountKind,
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 						{
 							Kind:      "non-matching-kind",
@@ -345,7 +344,7 @@ func TestServiceAccountActionExecute(t *testing.T) {
 					},
 				},
 			},
-			expectedAdditionalItems: []ResourceIdentifier{
+			expectedAdditionalItems: []velero.ResourceIdentifier{
 				{
 					GroupResource: kuberesource.ClusterRoleBindings,
 					Name:          "crb-2",
@@ -377,8 +376,8 @@ func TestServiceAccountActionExecute(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Create the action struct directly so we don't need to mock a clientset
-			action := &serviceAccountAction{
-				log:                 arktest.NewLogger(),
+			action := &ServiceAccountAction{
+				log:                 velerotest.NewLogger(),
 				clusterRoleBindings: newV1ClusterRoleBindingList(test.crbs),
 			}
 
@@ -409,17 +408,17 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 		name                    string
 		serviceAccount          runtime.Unstructured
 		crbs                    []rbacbeta.ClusterRoleBinding
-		expectedAdditionalItems []ResourceIdentifier
+		expectedAdditionalItems []velero.ResourceIdentifier
 	}{
 		{
 			name: "no crbs",
-			serviceAccount: arktest.UnstructuredOrDie(`
+			serviceAccount: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "ServiceAccount",
 				"metadata": {
-					"namespace": "heptio-ark",
-					"name": "ark"
+					"namespace": "velero",
+					"name": "velero"
 				}
 			}
 			`),
@@ -428,13 +427,13 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 		},
 		{
 			name: "no matching crbs",
-			serviceAccount: arktest.UnstructuredOrDie(`
+			serviceAccount: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "ServiceAccount",
 				"metadata": {
-					"namespace": "heptio-ark",
-					"name": "ark"
+					"namespace": "velero",
+					"name": "velero"
 				}
 			}
 			`),
@@ -448,17 +447,17 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 						},
 						{
 							Kind:      "non-matching-kind",
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 						{
 							Kind:      rbacbeta.ServiceAccountKind,
 							Namespace: "non-matching-ns",
-							Name:      "ark",
+							Name:      "velero",
 						},
 						{
 							Kind:      rbacbeta.ServiceAccountKind,
-							Namespace: "heptio-ark",
+							Namespace: "velero",
 							Name:      "non-matching-name",
 						},
 					},
@@ -471,13 +470,13 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 		},
 		{
 			name: "some matching crbs",
-			serviceAccount: arktest.UnstructuredOrDie(`
+			serviceAccount: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "ServiceAccount",
 				"metadata": {
-					"namespace": "heptio-ark",
-					"name": "ark"
+					"namespace": "velero",
+					"name": "velero"
 				}
 			}
 			`),
@@ -509,8 +508,8 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 						},
 						{
 							Kind:      rbacbeta.ServiceAccountKind,
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 					},
 					RoleRef: rbacbeta.RoleRef{
@@ -524,8 +523,8 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 					Subjects: []rbacbeta.Subject{
 						{
 							Kind:      rbacbeta.ServiceAccountKind,
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 					},
 					RoleRef: rbacbeta.RoleRef{
@@ -539,8 +538,8 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 					Subjects: []rbacbeta.Subject{
 						{
 							Kind:      rbacbeta.ServiceAccountKind,
-							Namespace: "heptio-ark",
-							Name:      "ark",
+							Namespace: "velero",
+							Name:      "velero",
 						},
 						{
 							Kind:      "non-matching-kind",
@@ -553,7 +552,7 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 					},
 				},
 			},
-			expectedAdditionalItems: []ResourceIdentifier{
+			expectedAdditionalItems: []velero.ResourceIdentifier{
 				{
 					GroupResource: kuberesource.ClusterRoleBindings,
 					Name:          "crb-2",
@@ -585,8 +584,8 @@ func TestServiceAccountActionExecuteOnBeta1(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Create the action struct directly so we don't need to mock a clientset
-			action := &serviceAccountAction{
-				log:                 arktest.NewLogger(),
+			action := &ServiceAccountAction{
+				log:                 velerotest.NewLogger(),
 				clusterRoleBindings: newV1beta1ClusterRoleBindingList(test.crbs),
 			}
 

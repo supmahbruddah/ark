@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package backup
 import (
 	"archive/tar"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"time"
 
@@ -32,27 +33,27 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cloudprovider"
-	"github.com/heptio/ark/pkg/discovery"
-	"github.com/heptio/ark/pkg/kuberesource"
-	"github.com/heptio/ark/pkg/podexec"
-	"github.com/heptio/ark/pkg/restic"
-	"github.com/heptio/ark/pkg/volume"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	"github.com/vmware-tanzu/velero/pkg/podexec"
+	"github.com/vmware-tanzu/velero/pkg/restic"
+	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
 type itemBackupperFactory interface {
 	newItemBackupper(
 		backup *Request,
-		backedUpItems map[itemKey]struct{},
 		podCommandExecutor podexec.PodCommandExecutor,
 		tarWriter tarWriter,
 		dynamicFactory client.DynamicFactory,
 		discoveryHelper discovery.Helper,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		blockStoreGetter BlockStoreGetter,
+		volumeSnapshotterGetter VolumeSnapshotterGetter,
 	) ItemBackupper
 }
 
@@ -60,24 +61,22 @@ type defaultItemBackupperFactory struct{}
 
 func (f *defaultItemBackupperFactory) newItemBackupper(
 	backupRequest *Request,
-	backedUpItems map[itemKey]struct{},
 	podCommandExecutor podexec.PodCommandExecutor,
 	tarWriter tarWriter,
 	dynamicFactory client.DynamicFactory,
 	discoveryHelper discovery.Helper,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	blockStoreGetter BlockStoreGetter,
+	volumeSnapshotterGetter VolumeSnapshotterGetter,
 ) ItemBackupper {
 	ib := &defaultItemBackupper{
-		backupRequest:         backupRequest,
-		backedUpItems:         backedUpItems,
-		tarWriter:             tarWriter,
-		dynamicFactory:        dynamicFactory,
-		discoveryHelper:       discoveryHelper,
-		resticBackupper:       resticBackupper,
-		resticSnapshotTracker: resticSnapshotTracker,
-		blockStoreGetter:      blockStoreGetter,
+		backupRequest:           backupRequest,
+		tarWriter:               tarWriter,
+		dynamicFactory:          dynamicFactory,
+		discoveryHelper:         discoveryHelper,
+		resticBackupper:         resticBackupper,
+		resticSnapshotTracker:   resticSnapshotTracker,
+		volumeSnapshotterGetter: volumeSnapshotterGetter,
 
 		itemHookHandler: &defaultItemHookHandler{
 			podCommandExecutor: podCommandExecutor,
@@ -91,80 +90,87 @@ func (f *defaultItemBackupperFactory) newItemBackupper(
 }
 
 type ItemBackupper interface {
-	backupItem(logger logrus.FieldLogger, obj runtime.Unstructured, groupResource schema.GroupResource) error
+	backupItem(logger logrus.FieldLogger, obj runtime.Unstructured, groupResource schema.GroupResource) (bool, error)
 }
 
 type defaultItemBackupper struct {
-	backupRequest         *Request
-	backedUpItems         map[itemKey]struct{}
-	tarWriter             tarWriter
-	dynamicFactory        client.DynamicFactory
-	discoveryHelper       discovery.Helper
-	resticBackupper       restic.Backupper
-	resticSnapshotTracker *pvcSnapshotTracker
-	blockStoreGetter      BlockStoreGetter
+	backupRequest           *Request
+	tarWriter               tarWriter
+	dynamicFactory          client.DynamicFactory
+	discoveryHelper         discovery.Helper
+	resticBackupper         restic.Backupper
+	resticSnapshotTracker   *pvcSnapshotTracker
+	volumeSnapshotterGetter VolumeSnapshotterGetter
 
-	itemHookHandler             itemHookHandler
-	additionalItemBackupper     ItemBackupper
-	snapshotLocationBlockStores map[string]cloudprovider.BlockStore
+	itemHookHandler                    itemHookHandler
+	additionalItemBackupper            ItemBackupper
+	snapshotLocationVolumeSnapshotters map[string]velero.VolumeSnapshotter
 }
 
 // backupItem backs up an individual item to tarWriter. The item may be excluded based on the
 // namespaces IncludesExcludes list.
-func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtime.Unstructured, groupResource schema.GroupResource) error {
+// In addition to the error return, backupItem also returns a bool indicating whether the item
+// was actually backed up.
+func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtime.Unstructured, groupResource schema.GroupResource) (bool, error) {
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	namespace := metadata.GetNamespace()
 	name := metadata.GetName()
 
 	log := logger.WithField("name", name)
-	if namespace != "" {
-		log = log.WithField("namespace", namespace)
+	log = log.WithField("resource", groupResource)
+	log = log.WithField("namespace", namespace)
+
+	if metadata.GetLabels()["velero.io/exclude-from-backup"] == "true" {
+		log.Info("Excluding item because it has label velero.io/exclude-from-backup=true")
+		return false, nil
 	}
 
 	// NOTE: we have to re-check namespace & resource includes/excludes because it's possible that
 	// backupItem can be invoked by a custom action.
 	if namespace != "" && !ib.backupRequest.NamespaceIncludesExcludes.ShouldInclude(namespace) {
 		log.Info("Excluding item because namespace is excluded")
-		return nil
+		return false, nil
 	}
 
 	// NOTE: we specifically allow namespaces to be backed up even if IncludeClusterResources is
 	// false.
 	if namespace == "" && groupResource != kuberesource.Namespaces && ib.backupRequest.Spec.IncludeClusterResources != nil && !*ib.backupRequest.Spec.IncludeClusterResources {
 		log.Info("Excluding item because resource is cluster-scoped and backup.spec.includeClusterResources is false")
-		return nil
+		return false, nil
 	}
 
 	if !ib.backupRequest.ResourceIncludesExcludes.ShouldInclude(groupResource.String()) {
 		log.Info("Excluding item because resource is excluded")
-		return nil
+		return false, nil
 	}
 
 	if metadata.GetDeletionTimestamp() != nil {
 		log.Info("Skipping item because it's being deleted.")
-		return nil
+		return false, nil
 	}
+
 	key := itemKey{
-		resource:  groupResource.String(),
+		resource:  resourceKey(obj),
 		namespace: namespace,
 		name:      name,
 	}
 
-	if _, exists := ib.backedUpItems[key]; exists {
+	if _, exists := ib.backupRequest.BackedUpItems[key]; exists {
 		log.Info("Skipping item because it's already been backed up.")
-		return nil
+		// returning true since this item *is* in the backup, even though we're not backing it up here
+		return true, nil
 	}
-	ib.backedUpItems[key] = struct{}{}
+	ib.backupRequest.BackedUpItems[key] = struct{}{}
 
-	log.Info("Backing up resource")
+	log.Info("Backing up item")
 
 	log.Debug("Executing pre hooks")
 	if err := ib.itemHookHandler.handleHooks(log, groupResource, obj, ib.backupRequest.ResourceHooks, hookPhasePre); err != nil {
-		return err
+		return false, err
 	}
 
 	var (
@@ -181,18 +187,30 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 			// nil it on error since it's not valid
 			pod = nil
 		} else {
-			// get the volumes to backup using restic, and add any of them that are PVCs to the pvc snapshot
-			// tracker, so that when we backup PVCs/PVs via an item action in the next step, we don't snapshot
-			// PVs that will have their data backed up with restic.
-			resticVolumesToBackup = restic.GetVolumesToBackup(pod)
+			// Get the list of volumes to back up using restic from the pod's annotations. Remove from this list
+			// any volumes that use a PVC that we've already backed up (this would be in a read-write-many scenario,
+			// where it's been backed up from another pod), since we don't need >1 backup per PVC.
+			for _, volume := range restic.GetVolumesToBackup(pod) {
+				if found, pvcName := ib.resticSnapshotTracker.HasPVCForPodVolume(pod, volume); found {
+					log.WithFields(map[string]interface{}{
+						"podVolume": volume,
+						"pvcName":   pvcName,
+					}).Info("Pod volume uses a persistent volume claim which has already been backed up with restic from another pod, skipping.")
+					continue
+				}
 
+				resticVolumesToBackup = append(resticVolumesToBackup, volume)
+			}
+
+			// track the volumes that are PVCs using the PVC snapshot tracker, so that when we backup PVCs/PVs
+			// via an item action in the next step, we don't snapshot PVs that will have their data backed up
+			// with restic.
 			ib.resticSnapshotTracker.Track(pod, resticVolumesToBackup)
 		}
 	}
 
 	updatedObj, err := ib.executeActions(log, obj, groupResource, name, namespace, metadata)
 	if err != nil {
-		log.WithError(err).Error("Error executing item actions")
 		backupErrs = append(backupErrs, err)
 
 		// if there was an error running actions, execute post hooks and return
@@ -201,12 +219,15 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 			backupErrs = append(backupErrs, err)
 		}
 
-		return kubeerrs.NewAggregate(backupErrs)
+		return false, kubeerrs.NewAggregate(backupErrs)
 	}
 	obj = updatedObj
 	if metadata, err = meta.Accessor(obj); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
+	// update name and namespace in case they were modified in an action
+	name = metadata.GetName()
+	namespace = metadata.GetNamespace()
 
 	if groupResource == kuberesource.PersistentVolumes {
 		if err := ib.takePVSnapshot(obj, log); err != nil {
@@ -215,15 +236,11 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	}
 
 	if groupResource == kuberesource.Pods && pod != nil {
-		// this function will return partial results, so process volumeSnapshots
+		// this function will return partial results, so process podVolumeBackups
 		// even if there are errors.
-		volumeSnapshots, errs := ib.backupPodVolumes(log, pod, resticVolumesToBackup)
+		podVolumeBackups, errs := ib.backupPodVolumes(log, pod, resticVolumesToBackup)
 
-		// annotate the pod with the successful volume snapshots
-		for volume, snapshot := range volumeSnapshots {
-			restic.SetPodSnapshotAnnotation(metadata, volume, snapshot)
-		}
-
+		ib.backupRequest.PodVolumeBackups = append(ib.backupRequest.PodVolumeBackups, podVolumeBackups...)
 		backupErrs = append(backupErrs, errs...)
 	}
 
@@ -233,7 +250,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	}
 
 	if len(backupErrs) != 0 {
-		return kubeerrs.NewAggregate(backupErrs)
+		return false, kubeerrs.NewAggregate(backupErrs)
 	}
 
 	var filePath string
@@ -245,7 +262,7 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 
 	itemBytes, err := json.Marshal(obj.UnstructuredContent())
 	if err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 
 	hdr := &tar.Header{
@@ -257,19 +274,19 @@ func (ib *defaultItemBackupper) backupItem(logger logrus.FieldLogger, obj runtim
 	}
 
 	if err := ib.tarWriter.WriteHeader(hdr); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 
 	if _, err := ib.tarWriter.Write(itemBytes); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 
-	return nil
+	return true, nil
 }
 
-// backupPodVolumes triggers restic backups of the specified pod volumes, and returns a map of volume name -> snapshot ID
+// backupPodVolumes triggers restic backups of the specified pod volumes, and returns a list of PodVolumeBackups
 // for volumes that were successfully backed up, and a slice of any errors that were encountered.
-func (ib *defaultItemBackupper) backupPodVolumes(log logrus.FieldLogger, pod *corev1api.Pod, volumes []string) (map[string]string, []error) {
+func (ib *defaultItemBackupper) backupPodVolumes(log logrus.FieldLogger, pod *corev1api.Pod, volumes []string) ([]*velerov1api.PodVolumeBackup, []error) {
 	if len(volumes) == 0 {
 		return nil, nil
 	}
@@ -279,7 +296,7 @@ func (ib *defaultItemBackupper) backupPodVolumes(log logrus.FieldLogger, pod *co
 		return nil, nil
 	}
 
-	return ib.resticBackupper.BackupPodVolumes(ib.backupRequest.Backup, pod, log)
+	return ib.resticBackupper.BackupPodVolumes(ib.backupRequest.Backup, pod, volumes, log)
 }
 
 func (ib *defaultItemBackupper) executeActions(
@@ -300,6 +317,11 @@ func (ib *defaultItemBackupper) executeActions(
 			continue
 		}
 
+		if namespace == "" && !action.namespaceIncludesExcludes.IncludeEverything() {
+			log.Debug("Skipping action because resource is cluster-scoped and action only applies to specific namespaces")
+			continue
+		}
+
 		if !action.selector.Matches(labels.Set(metadata.GetLabels())) {
 			log.Debug("Skipping action because label selector does not match")
 			continue
@@ -309,11 +331,6 @@ func (ib *defaultItemBackupper) executeActions(
 
 		updatedItem, additionalItemIdentifiers, err := action.Execute(obj, ib.backupRequest.Backup)
 		if err != nil {
-			// We want this to show up in the log file at the place where the error occurs. When we return
-			// the error, it get aggregated with all the other ones at the end of the backup, making it
-			// harder to tell when it happened.
-			log.WithError(err).Error("error executing custom action")
-
 			return nil, errors.Wrapf(err, "error executing custom action (groupResource=%s, namespace=%s, name=%s)", groupResource.String(), namespace, name)
 		}
 		obj = updatedItem
@@ -331,10 +348,10 @@ func (ib *defaultItemBackupper) executeActions(
 
 			additionalItem, err := client.Get(additionalItem.Name, metav1.GetOptions{})
 			if err != nil {
-				return nil, err
+				return nil, errors.WithStack(err)
 			}
 
-			if err = ib.additionalItemBackupper.backupItem(log, additionalItem, gvr.GroupResource()); err != nil {
+			if _, err = ib.additionalItemBackupper.backupItem(log, additionalItem, gvr.GroupResource()); err != nil {
 				return nil, err
 			}
 		}
@@ -343,14 +360,14 @@ func (ib *defaultItemBackupper) executeActions(
 	return obj, nil
 }
 
-// blockStore instantiates and initializes a BlockStore given a VolumeSnapshotLocation,
+// volumeSnapshotter instantiates and initializes a VolumeSnapshotter given a VolumeSnapshotLocation,
 // or returns an existing one if one's already been initialized for the location.
-func (ib *defaultItemBackupper) blockStore(snapshotLocation *api.VolumeSnapshotLocation) (cloudprovider.BlockStore, error) {
-	if bs, ok := ib.snapshotLocationBlockStores[snapshotLocation.Name]; ok {
+func (ib *defaultItemBackupper) volumeSnapshotter(snapshotLocation *api.VolumeSnapshotLocation) (velero.VolumeSnapshotter, error) {
+	if bs, ok := ib.snapshotLocationVolumeSnapshotters[snapshotLocation.Name]; ok {
 		return bs, nil
 	}
 
-	bs, err := ib.blockStoreGetter.GetBlockStore(snapshotLocation.Spec.Provider)
+	bs, err := ib.volumeSnapshotterGetter.GetVolumeSnapshotter(snapshotLocation.Spec.Provider)
 	if err != nil {
 		return nil, err
 	}
@@ -359,10 +376,10 @@ func (ib *defaultItemBackupper) blockStore(snapshotLocation *api.VolumeSnapshotL
 		return nil, err
 	}
 
-	if ib.snapshotLocationBlockStores == nil {
-		ib.snapshotLocationBlockStores = make(map[string]cloudprovider.BlockStore)
+	if ib.snapshotLocationVolumeSnapshotters == nil {
+		ib.snapshotLocationVolumeSnapshotters = make(map[string]velero.VolumeSnapshotter)
 	}
-	ib.snapshotLocationBlockStores[snapshotLocation.Name] = bs
+	ib.snapshotLocationVolumeSnapshotters[snapshotLocation.Name] = bs
 
 	return bs, nil
 }
@@ -387,83 +404,78 @@ func (ib *defaultItemBackupper) takePVSnapshot(obj runtime.Unstructured, log log
 		return errors.WithStack(err)
 	}
 
+	log = log.WithField("persistentVolume", pv.Name)
+
 	// If this PV is claimed, see if we've already taken a (restic) snapshot of the contents
 	// of this PV. If so, don't take a snapshot.
 	if pv.Spec.ClaimRef != nil {
 		if ib.resticSnapshotTracker.Has(pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name) {
-			log.Info("Skipping Persistent Volume snapshot because volume has already been backed up.")
+			log.Info("Skipping snapshot of persistent volume because volume is being backed up with restic.")
 			return nil
 		}
 	}
 
-	metadata, err := meta.Accessor(obj)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	pvFailureDomainZone := metadata.GetLabels()[zoneLabel]
+	pvFailureDomainZone := pv.Labels[zoneLabel]
 	if pvFailureDomainZone == "" {
 		log.Infof("label %q is not present on PersistentVolume", zoneLabel)
 	}
 
 	var (
 		volumeID, location string
-		blockStore         cloudprovider.BlockStore
+		volumeSnapshotter  velero.VolumeSnapshotter
 	)
 
 	for _, snapshotLocation := range ib.backupRequest.SnapshotLocations {
-		bs, err := ib.blockStore(snapshotLocation)
+		log := log.WithField("volumeSnapshotLocation", snapshotLocation.Name)
+
+		bs, err := ib.volumeSnapshotter(snapshotLocation)
 		if err != nil {
-			log.WithError(err).WithField("volumeSnapshotLocation", snapshotLocation).Error("Error getting block store for volume snapshot location")
+			log.WithError(err).Error("Error getting volume snapshotter for volume snapshot location")
 			continue
 		}
-
-		log := log.WithFields(map[string]interface{}{
-			"volumeSnapshotLocation": snapshotLocation.Name,
-			"persistentVolume":       metadata.GetName(),
-		})
 
 		if volumeID, err = bs.GetVolumeID(obj); err != nil {
 			log.WithError(err).Errorf("Error attempting to get volume ID for persistent volume")
 			continue
 		}
 		if volumeID == "" {
-			log.Infof("No volume ID returned by block store for persistent volume")
+			log.Infof("No volume ID returned by volume snapshotter for persistent volume")
 			continue
 		}
 
 		log.Infof("Got volume ID for persistent volume")
-		blockStore = bs
+		volumeSnapshotter = bs
 		location = snapshotLocation.Name
 		break
 	}
 
-	if blockStore == nil {
-		log.Info("PersistentVolume is not a supported volume type for snapshots, skipping.")
+	if volumeSnapshotter == nil {
+		log.Info("Persistent volume is not a supported volume type for snapshots, skipping.")
 		return nil
 	}
 
 	log = log.WithField("volumeID", volumeID)
 
-	tags := map[string]string{
-		"ark.heptio.com/backup": ib.backupRequest.Name,
-		"ark.heptio.com/pv":     metadata.GetName(),
+	// create tags from the backup's labels
+	tags := map[string]string{}
+	for k, v := range ib.backupRequest.GetLabels() {
+		tags[k] = v
 	}
+	tags["velero.io/backup"] = ib.backupRequest.Name
+	tags["velero.io/pv"] = pv.Name
 
 	log.Info("Getting volume information")
-	volumeType, iops, err := blockStore.GetVolumeInfo(volumeID, pvFailureDomainZone)
+	volumeType, iops, err := volumeSnapshotter.GetVolumeInfo(volumeID, pvFailureDomainZone)
 	if err != nil {
-		log.WithError(err).Error("error getting volume info")
 		return errors.WithMessage(err, "error getting volume info")
 	}
 
-	log.Info("Snapshotting PersistentVolume")
-	snapshot := volumeSnapshot(ib.backupRequest.Backup, metadata.GetName(), volumeID, volumeType, pvFailureDomainZone, location, iops)
+	log.Info("Snapshotting persistent volume")
+	snapshot := volumeSnapshot(ib.backupRequest.Backup, pv.Name, volumeID, volumeType, pvFailureDomainZone, location, iops)
 
 	var errs []error
-	snapshotID, err := blockStore.CreateSnapshot(snapshot.Spec.ProviderVolumeID, snapshot.Spec.VolumeAZ, tags)
+	snapshotID, err := volumeSnapshotter.CreateSnapshot(snapshot.Spec.ProviderVolumeID, snapshot.Spec.VolumeAZ, tags)
 	if err != nil {
-		log.WithError(err).Error("error creating snapshot")
 		errs = append(errs, errors.Wrap(err, "error taking snapshot of volume"))
 		snapshot.Status.Phase = volume.SnapshotPhaseFailed
 	} else {
@@ -492,4 +504,11 @@ func volumeSnapshot(backup *api.Backup, volumeName, volumeID, volumeType, az, lo
 			Phase: volume.SnapshotPhaseNew,
 		},
 	}
+}
+
+// resourceKey returns a string representing the object's GroupVersionKind (e.g.
+// apps/v1/Deployment).
+func resourceKey(obj runtime.Unstructured) string {
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	return fmt.Sprintf("%s/%s", gvk.GroupVersion().String(), gvk.Kind)
 }

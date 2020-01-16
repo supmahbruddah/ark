@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ package restic
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd/cli/restic/repo"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/restic/repo"
 )
 
 func NewCommand(f client.Factory) *cobra.Command {

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,19 +25,20 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/cmd/util/downloadrequest"
-	clientset "github.com/heptio/ark/pkg/generated/clientset/versioned"
-	"github.com/heptio/ark/pkg/volume"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
+	clientset "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
+	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
 // DescribeBackup describes a backup in human-readable format.
 func DescribeBackup(
-	backup *arkv1api.Backup,
-	deleteRequests []arkv1api.DeleteBackupRequest,
-	podVolumeBackups []arkv1api.PodVolumeBackup,
+	backup *velerov1api.Backup,
+	deleteRequests []velerov1api.DeleteBackupRequest,
+	podVolumeBackups []velerov1api.PodVolumeBackup,
 	details bool,
-	arkClient clientset.Interface,
+	veleroClient clientset.Interface,
+	insecureSkipTLSVerify bool,
 ) string {
 	return Describe(func(d *Describer) {
 		d.DescribeMetadata(backup.ObjectMeta)
@@ -45,15 +46,36 @@ func DescribeBackup(
 		d.Println()
 		phase := backup.Status.Phase
 		if phase == "" {
-			phase = arkv1api.BackupPhaseNew
+			phase = velerov1api.BackupPhaseNew
 		}
-		d.Printf("Phase:\t%s\n", phase)
+
+		logsNote := ""
+		if backup.Status.Phase == velerov1api.BackupPhaseFailed || backup.Status.Phase == velerov1api.BackupPhasePartiallyFailed {
+			logsNote = fmt.Sprintf(" (run `velero backup logs %s` for more information)", backup.Name)
+		}
+
+		d.Printf("Phase:\t%s%s\n", phase, logsNote)
+
+		status := backup.Status
+		if len(status.ValidationErrors) > 0 {
+			d.Println()
+			d.Printf("Validation errors:")
+			for _, ve := range status.ValidationErrors {
+				d.Printf("\t%s\n", ve)
+			}
+		}
+
+		if status.Phase == velerov1api.BackupPhasePartiallyFailed {
+			d.Println()
+			d.Printf("Errors:\t%d\n", status.Errors)
+			d.Printf("Warnings:\t%d\n", status.Warnings)
+		}
 
 		d.Println()
 		DescribeBackupSpec(d, backup.Spec)
 
 		d.Println()
-		DescribeBackupStatus(d, backup, details, arkClient)
+		DescribeBackupStatus(d, backup, details, veleroClient, insecureSkipTLSVerify)
 
 		if len(deleteRequests) > 0 {
 			d.Println()
@@ -68,7 +90,7 @@ func DescribeBackup(
 }
 
 // DescribeBackupSpec describes a backup spec in human-readable format.
-func DescribeBackupSpec(d *Describer, spec arkv1api.BackupSpec) {
+func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	// TODO make a helper for this and use it in all the describers.
 	d.Printf("Namespaces:\n")
 	var s string
@@ -163,10 +185,21 @@ func DescribeBackupSpec(d *Describer, spec arkv1api.BackupSpec) {
 			}
 			d.Printf("\t\t\tLabel selector:\t%s\n", s)
 
-			for _, hook := range backupResourceHookSpec.Hooks {
+			for _, hook := range backupResourceHookSpec.PreHooks {
 				if hook.Exec != nil {
 					d.Println()
-					d.Printf("\t\t\tExec Hook:\n")
+					d.Printf("\t\t\tPre Exec Hook:\n")
+					d.Printf("\t\t\t\tContainer:\t%s\n", hook.Exec.Container)
+					d.Printf("\t\t\t\tCommand:\t%s\n", strings.Join(hook.Exec.Command, " "))
+					d.Printf("\t\t\t\tOn Error:\t%s\n", hook.Exec.OnError)
+					d.Printf("\t\t\t\tTimeout:\t%s\n", hook.Exec.Timeout.Duration)
+				}
+			}
+
+			for _, hook := range backupResourceHookSpec.PostHooks {
+				if hook.Exec != nil {
+					d.Println()
+					d.Printf("\t\t\tPost Exec Hook:\n")
 					d.Printf("\t\t\t\tContainer:\t%s\n", hook.Exec.Container)
 					d.Printf("\t\t\t\tCommand:\t%s\n", strings.Join(hook.Exec.Command, " "))
 					d.Printf("\t\t\t\tOn Error:\t%s\n", hook.Exec.OnError)
@@ -179,56 +212,44 @@ func DescribeBackupSpec(d *Describer, spec arkv1api.BackupSpec) {
 }
 
 // DescribeBackupStatus describes a backup status in human-readable format.
-func DescribeBackupStatus(d *Describer, backup *arkv1api.Backup, details bool, arkClient clientset.Interface) {
+func DescribeBackupStatus(d *Describer, backup *velerov1api.Backup, details bool, veleroClient clientset.Interface, insecureSkipTLSVerify bool) {
 	status := backup.Status
 
 	d.Printf("Backup Format Version:\t%d\n", status.Version)
 
 	d.Println()
 	// "<n/a>" output should only be applicable for backups that failed validation
-	if status.StartTimestamp.Time.IsZero() {
+	if status.StartTimestamp == nil || status.StartTimestamp.Time.IsZero() {
 		d.Printf("Started:\t%s\n", "<n/a>")
 	} else {
 		d.Printf("Started:\t%s\n", status.StartTimestamp.Time)
 	}
-	if status.CompletionTimestamp.Time.IsZero() {
+	if status.CompletionTimestamp == nil || status.CompletionTimestamp.Time.IsZero() {
 		d.Printf("Completed:\t%s\n", "<n/a>")
 	} else {
 		d.Printf("Completed:\t%s\n", status.CompletionTimestamp.Time)
 	}
 
 	d.Println()
-	d.Printf("Expiration:\t%s\n", status.Expiration.Time)
+	// Expiration can't be 0, it is always set to a 30-day default. It can be nil
+	// if the controller hasn't processed this Backup yet, in which case this will
+	// just display `<nil>`, though this should be temporary.
+	d.Printf("Expiration:\t%s\n", status.Expiration)
 	d.Println()
 
-	d.Printf("Validation errors:")
-	if len(status.ValidationErrors) == 0 {
-		d.Printf("\t<none>\n")
-	} else {
-		for _, ve := range status.ValidationErrors {
-			d.Printf("\t%s\n", ve)
-		}
-	}
-
-	d.Println()
-	if len(status.VolumeBackups) > 0 {
-		// pre-v0.10 backup
-		d.Printf("Persistent Volumes:\n")
-		for pvName, info := range status.VolumeBackups {
-			printSnapshot(d, pvName, info.SnapshotID, info.Type, info.AvailabilityZone, info.Iops)
-		}
-		return
+	if details {
+		describeBackupResourceList(d, backup, veleroClient, insecureSkipTLSVerify)
+		d.Println()
 	}
 
 	if status.VolumeSnapshotsAttempted > 0 {
-		// v0.10+ backup
 		if !details {
 			d.Printf("Persistent Volumes:\t%d of %d snapshots completed successfully (specify --details for more information)\n", status.VolumeSnapshotsCompleted, status.VolumeSnapshotsAttempted)
 			return
 		}
 
 		buf := new(bytes.Buffer)
-		if err := downloadrequest.Stream(arkClient.ArkV1(), backup.Namespace, backup.Name, arkv1api.DownloadTargetKindBackupVolumeSnapshots, buf, downloadRequestTimeout); err != nil {
+		if err := downloadrequest.Stream(veleroClient.VeleroV1(), backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupVolumeSnapshots, buf, downloadRequestTimeout, insecureSkipTLSVerify); err != nil {
 			d.Printf("Persistent Volumes:\t<error getting volume snapshot info: %v>\n", err)
 			return
 		}
@@ -241,7 +262,7 @@ func DescribeBackupStatus(d *Describer, backup *arkv1api.Backup, details bool, a
 
 		d.Printf("Persistent Volumes:\n")
 		for _, snap := range snapshots {
-			printSnapshot(d, snap.Spec.PersistentVolumeName, snap.Status.ProviderSnapshotID, snap.Spec.VolumeType, snap.Spec.VolumeAZ, snap.Spec.VolumeIOPS)
+			describeSnapshot(d, snap.Spec.PersistentVolumeName, snap.Status.ProviderSnapshotID, snap.Spec.VolumeType, snap.Spec.VolumeAZ, snap.Spec.VolumeIOPS)
 		}
 		return
 	}
@@ -249,7 +270,38 @@ func DescribeBackupStatus(d *Describer, backup *arkv1api.Backup, details bool, a
 	d.Printf("Persistent Volumes: <none included>\n")
 }
 
-func printSnapshot(d *Describer, pvName, snapshotID, volumeType, volumeAZ string, iops *int64) {
+func describeBackupResourceList(d *Describer, backup *velerov1api.Backup, veleroClient clientset.Interface, insecureSkipTLSVerify bool) {
+	buf := new(bytes.Buffer)
+	if err := downloadrequest.Stream(veleroClient.VeleroV1(), backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupResourceList, buf, downloadRequestTimeout, insecureSkipTLSVerify); err != nil {
+		if err == downloadrequest.ErrNotFound {
+			d.Println("Resource List:\t<backup resource list not found, this could be because this backup was taken prior to Velero 1.1.0>")
+		} else {
+			d.Printf("Resource List:\t<error getting backup resource list: %v>\n", err)
+		}
+		return
+	}
+
+	var resourceList map[string][]string
+	if err := json.NewDecoder(buf).Decode(&resourceList); err != nil {
+		d.Printf("Resource List:\t<error reading backup resource list: %v>\n", err)
+		return
+	}
+
+	d.Println("Resource List:")
+
+	// Sort GVKs in output
+	gvks := make([]string, 0, len(resourceList))
+	for gvk := range resourceList {
+		gvks = append(gvks, gvk)
+	}
+	sort.Strings(gvks)
+
+	for _, gvk := range gvks {
+		d.Printf("\t%s:\n\t\t- %s\n", gvk, strings.Join(resourceList[gvk], "\n\t\t- "))
+	}
+}
+
+func describeSnapshot(d *Describer, pvName, snapshotID, volumeType, volumeAZ string, iops *int64) {
 	d.Printf("\t%s:\n", pvName)
 	d.Printf("\t\tSnapshot ID:\t%s\n", snapshotID)
 	d.Printf("\t\tType:\t%s\n", volumeType)
@@ -262,7 +314,7 @@ func printSnapshot(d *Describer, pvName, snapshotID, volumeType, volumeAZ string
 }
 
 // DescribeDeleteBackupRequests describes delete backup requests in human-readable format.
-func DescribeDeleteBackupRequests(d *Describer, requests []arkv1api.DeleteBackupRequest) {
+func DescribeDeleteBackupRequests(d *Describer, requests []velerov1api.DeleteBackupRequest) {
 	d.Printf("Deletion Attempts")
 	if count := failedDeletionCount(requests); count > 0 {
 		d.Printf(" (%d failed)", count)
@@ -287,10 +339,10 @@ func DescribeDeleteBackupRequests(d *Describer, requests []arkv1api.DeleteBackup
 	}
 }
 
-func failedDeletionCount(requests []arkv1api.DeleteBackupRequest) int {
+func failedDeletionCount(requests []velerov1api.DeleteBackupRequest) int {
 	var count int
 	for _, req := range requests {
-		if req.Status.Phase == arkv1api.DeleteBackupRequestPhaseProcessed && len(req.Status.Errors) > 0 {
+		if req.Status.Phase == velerov1api.DeleteBackupRequestPhaseProcessed && len(req.Status.Errors) > 0 {
 			count++
 		}
 	}
@@ -298,7 +350,7 @@ func failedDeletionCount(requests []arkv1api.DeleteBackupRequest) int {
 }
 
 // DescribePodVolumeBackups describes pod volume backups in human-readable format.
-func DescribePodVolumeBackups(d *Describer, backups []arkv1api.PodVolumeBackup, details bool) {
+func DescribePodVolumeBackups(d *Describer, backups []velerov1api.PodVolumeBackup, details bool) {
 	if details {
 		d.Printf("Restic Backups:\n")
 	} else {
@@ -310,10 +362,10 @@ func DescribePodVolumeBackups(d *Describer, backups []arkv1api.PodVolumeBackup, 
 
 	// go through phases in a specific order
 	for _, phase := range []string{
-		string(arkv1api.PodVolumeBackupPhaseCompleted),
-		string(arkv1api.PodVolumeBackupPhaseFailed),
+		string(velerov1api.PodVolumeBackupPhaseCompleted),
+		string(velerov1api.PodVolumeBackupPhaseFailed),
 		"In Progress",
-		string(arkv1api.PodVolumeBackupPhaseNew),
+		string(velerov1api.PodVolumeBackupPhaseNew),
 	} {
 		if len(backupsByPhase[phase]) == 0 {
 			continue
@@ -329,7 +381,7 @@ func DescribePodVolumeBackups(d *Describer, backups []arkv1api.PodVolumeBackup, 
 		backupsByPod := new(volumesByPod)
 
 		for _, backup := range backupsByPhase[phase] {
-			backupsByPod.Add(backup.Spec.Pod.Namespace, backup.Spec.Pod.Name, backup.Spec.Volume)
+			backupsByPod.Add(backup.Spec.Pod.Namespace, backup.Spec.Pod.Name, backup.Spec.Volume, phase, backup.Status.Progress)
 		}
 
 		d.Printf("\t%s:\n", phase)
@@ -342,15 +394,15 @@ func DescribePodVolumeBackups(d *Describer, backups []arkv1api.PodVolumeBackup, 
 	}
 }
 
-func groupByPhase(backups []arkv1api.PodVolumeBackup) map[string][]arkv1api.PodVolumeBackup {
-	backupsByPhase := make(map[string][]arkv1api.PodVolumeBackup)
+func groupByPhase(backups []velerov1api.PodVolumeBackup) map[string][]velerov1api.PodVolumeBackup {
+	backupsByPhase := make(map[string][]velerov1api.PodVolumeBackup)
 
-	phaseToGroup := map[arkv1api.PodVolumeBackupPhase]string{
-		arkv1api.PodVolumeBackupPhaseCompleted:  string(arkv1api.PodVolumeBackupPhaseCompleted),
-		arkv1api.PodVolumeBackupPhaseFailed:     string(arkv1api.PodVolumeBackupPhaseFailed),
-		arkv1api.PodVolumeBackupPhaseInProgress: "In Progress",
-		arkv1api.PodVolumeBackupPhaseNew:        string(arkv1api.PodVolumeBackupPhaseNew),
-		"":                                      string(arkv1api.PodVolumeBackupPhaseNew),
+	phaseToGroup := map[velerov1api.PodVolumeBackupPhase]string{
+		velerov1api.PodVolumeBackupPhaseCompleted:  string(velerov1api.PodVolumeBackupPhaseCompleted),
+		velerov1api.PodVolumeBackupPhaseFailed:     string(velerov1api.PodVolumeBackupPhaseFailed),
+		velerov1api.PodVolumeBackupPhaseInProgress: "In Progress",
+		velerov1api.PodVolumeBackupPhaseNew:        string(velerov1api.PodVolumeBackupPhaseNew),
+		"":                                         string(velerov1api.PodVolumeBackupPhaseNew),
 	}
 
 	for _, backup := range backups {
@@ -375,12 +427,17 @@ type volumesByPod struct {
 
 // Add adds a pod volume with the specified pod namespace, name
 // and volume to the appropriate group.
-func (v *volumesByPod) Add(namespace, name, volume string) {
+func (v *volumesByPod) Add(namespace, name, volume, phase string, progress velerov1api.PodVolumeOperationProgress) {
 	if v.volumesByPodMap == nil {
 		v.volumesByPodMap = make(map[string]*podVolumeGroup)
 	}
 
 	key := fmt.Sprintf("%s/%s", namespace, name)
+
+	// append backup progress percentage if backup is in progress
+	if phase == "In Progress" && progress != (velerov1api.PodVolumeOperationProgress{}) {
+		volume = fmt.Sprintf("%s (%.2f%%)", volume, float64(progress.BytesDone)/float64(progress.TotalBytes)*100)
+	}
 
 	if group, ok := v.volumesByPodMap[key]; !ok {
 		group := &podVolumeGroup{

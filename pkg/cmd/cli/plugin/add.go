@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,15 +28,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd"
-	"github.com/heptio/ark/pkg/cmd/util/flag"
+	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/flag"
 )
 
 const (
 	pluginsVolumeName = "plugins"
-	arkDeployment     = "ark"
-	arkContainer      = "ark"
+	veleroDeployment  = "velero"
+	veleroContainer   = "velero"
 )
 
 func NewAddCommand(f client.Factory) *cobra.Command {
@@ -55,17 +56,17 @@ func NewAddCommand(f client.Factory) *cobra.Command {
 				cmd.CheckError(err)
 			}
 
-			arkDeploy, err := kubeClient.AppsV1beta1().Deployments(f.Namespace()).Get(arkDeployment, metav1.GetOptions{})
+			veleroDeploy, err := kubeClient.AppsV1().Deployments(f.Namespace()).Get(veleroDeployment, metav1.GetOptions{})
 			if err != nil {
 				cmd.CheckError(err)
 			}
 
-			original, err := json.Marshal(arkDeploy)
+			original, err := json.Marshal(veleroDeploy)
 			cmd.CheckError(err)
 
 			// ensure the plugins volume & mount exist
 			volumeExists := false
-			for _, volume := range arkDeploy.Spec.Template.Spec.Volumes {
+			for _, volume := range veleroDeploy.Spec.Template.Spec.Volumes {
 				if volume.Name == pluginsVolumeName {
 					volumeExists = true
 					break
@@ -85,47 +86,37 @@ func NewAddCommand(f client.Factory) *cobra.Command {
 					MountPath: "/plugins",
 				}
 
-				arkDeploy.Spec.Template.Spec.Volumes = append(arkDeploy.Spec.Template.Spec.Volumes, volume)
+				veleroDeploy.Spec.Template.Spec.Volumes = append(veleroDeploy.Spec.Template.Spec.Volumes, volume)
 
-				containers := arkDeploy.Spec.Template.Spec.Containers
+				containers := veleroDeploy.Spec.Template.Spec.Containers
 				containerIndex := -1
 				for x, container := range containers {
-					if container.Name == arkContainer {
+					if container.Name == veleroContainer {
 						containerIndex = x
 						break
 					}
 				}
 
 				if containerIndex < 0 {
-					cmd.CheckError(errors.New("ark container not found in ark deployment"))
+					cmd.CheckError(errors.New("velero container not found in velero deployment"))
 				}
 
 				containers[containerIndex].VolumeMounts = append(containers[containerIndex].VolumeMounts, volumeMount)
 			}
 
 			// add the plugin as an init container
-			plugin := v1.Container{
-				Name:            getName(args[0]),
-				Image:           args[0],
-				ImagePullPolicy: v1.PullPolicy(imagePullPolicyFlag.String()),
-				VolumeMounts: []v1.VolumeMount{
-					{
-						Name:      pluginsVolumeName,
-						MountPath: "/target",
-					},
-				},
-			}
+			plugin := *builder.ForPluginContainer(args[0], v1.PullPolicy(imagePullPolicyFlag.String())).Result()
 
-			arkDeploy.Spec.Template.Spec.InitContainers = append(arkDeploy.Spec.Template.Spec.InitContainers, plugin)
+			veleroDeploy.Spec.Template.Spec.InitContainers = append(veleroDeploy.Spec.Template.Spec.InitContainers, plugin)
 
 			// create & apply the patch
-			updated, err := json.Marshal(arkDeploy)
+			updated, err := json.Marshal(veleroDeploy)
 			cmd.CheckError(err)
 
 			patchBytes, err := jsonpatch.CreateMergePatch(original, updated)
 			cmd.CheckError(err)
 
-			_, err = kubeClient.AppsV1beta1().Deployments(arkDeploy.Namespace).Patch(arkDeploy.Name, types.MergePatchType, patchBytes)
+			_, err = kubeClient.AppsV1().Deployments(veleroDeploy.Namespace).Patch(veleroDeploy.Name, types.MergePatchType, patchBytes)
 			cmd.CheckError(err)
 		},
 	}
@@ -133,24 +124,4 @@ func NewAddCommand(f client.Factory) *cobra.Command {
 	c.Flags().Var(imagePullPolicyFlag, "image-pull-policy", fmt.Sprintf("the imagePullPolicy for the plugin container. Valid values are %s.", strings.Join(imagePullPolicies, ", ")))
 
 	return c
-}
-
-// getName returns the 'name' component of a docker
-// image (i.e. everything after the last '/' and before
-// any subsequent ':')
-func getName(image string) string {
-	slashIndex := strings.LastIndex(image, "/")
-	colonIndex := strings.LastIndex(image, ":")
-
-	start := 0
-	if slashIndex > 0 {
-		start = slashIndex + 1
-	}
-
-	end := len(image)
-	if colonIndex > slashIndex {
-		end = colonIndex
-	}
-
-	return image[start:end]
 }

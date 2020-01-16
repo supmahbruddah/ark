@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,11 +25,12 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd"
-	"github.com/heptio/ark/pkg/cmd/util/downloadrequest"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 )
 
 func NewDownloadCommand(f client.Factory) *cobra.Command {
@@ -40,7 +41,7 @@ func NewDownloadCommand(f client.Factory) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		Run: func(c *cobra.Command, args []string) {
 			cmd.CheckError(o.Complete(args))
-			cmd.CheckError(o.Validate(c, args))
+			cmd.CheckError(o.Validate(c, args, f))
 			cmd.CheckError(o.Run(c, f))
 		},
 	}
@@ -51,11 +52,12 @@ func NewDownloadCommand(f client.Factory) *cobra.Command {
 }
 
 type DownloadOptions struct {
-	Name         string
-	Output       string
-	Force        bool
-	Timeout      time.Duration
-	writeOptions int
+	Name                  string
+	Output                string
+	Force                 bool
+	Timeout               time.Duration
+	InsecureSkipTLSVerify bool
+	writeOptions          int
 }
 
 func NewDownloadOptions() *DownloadOptions {
@@ -68,9 +70,17 @@ func (o *DownloadOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.StringVarP(&o.Output, "output", "o", o.Output, "path to output file. Defaults to <NAME>-data.tar.gz in the current directory")
 	flags.BoolVar(&o.Force, "force", o.Force, "forces the download and will overwrite file if it exists already")
 	flags.DurationVar(&o.Timeout, "timeout", o.Timeout, "maximum time to wait to process download request")
+	flags.BoolVar(&o.InsecureSkipTLSVerify, "insecure-skip-tls-verify", o.InsecureSkipTLSVerify, "If true, the object store's TLS certificate will not be checked for validity. This is insecure and susceptible to man-in-the-middle attacks. Not recommended for production.")
 }
 
-func (o *DownloadOptions) Validate(c *cobra.Command, args []string) error {
+func (o *DownloadOptions) Validate(c *cobra.Command, args []string, f client.Factory) error {
+	veleroClient, err := f.Client()
+	cmd.CheckError(err)
+
+	if _, err := veleroClient.VeleroV1().Backups(f.Namespace()).Get(o.Name, metav1.GetOptions{}); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -94,7 +104,7 @@ func (o *DownloadOptions) Complete(args []string) error {
 }
 
 func (o *DownloadOptions) Run(c *cobra.Command, f client.Factory) error {
-	arkClient, err := f.Client()
+	veleroClient, err := f.Client()
 	cmd.CheckError(err)
 
 	backupDest, err := os.OpenFile(o.Output, o.writeOptions, 0600)
@@ -103,7 +113,7 @@ func (o *DownloadOptions) Run(c *cobra.Command, f client.Factory) error {
 	}
 	defer backupDest.Close()
 
-	err = downloadrequest.Stream(arkClient.ArkV1(), f.Namespace(), o.Name, v1.DownloadTargetKindBackupContents, backupDest, o.Timeout)
+	err = downloadrequest.Stream(veleroClient.VeleroV1(), f.Namespace(), o.Name, v1.DownloadTargetKindBackupContents, backupDest, o.Timeout, o.InsecureSkipTLSVerify)
 	if err != nil {
 		os.Remove(o.Output)
 		cmd.CheckError(err)

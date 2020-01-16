@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,44 +27,49 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
-	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
-	"github.com/heptio/ark/pkg/restic"
-	arkexec "github.com/heptio/ark/pkg/util/exec"
-	"github.com/heptio/ark/pkg/util/filesystem"
-	"github.com/heptio/ark/pkg/util/kube"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
+	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/restic"
+	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
+	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 type podVolumeBackupController struct {
 	*genericController
 
-	podVolumeBackupClient arkv1client.PodVolumeBackupsGetter
+	podVolumeBackupClient velerov1client.PodVolumeBackupsGetter
 	podVolumeBackupLister listers.PodVolumeBackupLister
 	secretLister          corev1listers.SecretLister
 	podLister             corev1listers.PodLister
 	pvcLister             corev1listers.PersistentVolumeClaimLister
+	pvLister              corev1listers.PersistentVolumeLister
 	backupLocationLister  listers.BackupStorageLocationLister
 	nodeName              string
 
-	processBackupFunc func(*arkv1api.PodVolumeBackup) error
+	processBackupFunc func(*velerov1api.PodVolumeBackup) error
 	fileSystem        filesystem.Interface
+	clock             clock.Clock
 }
 
 // NewPodVolumeBackupController creates a new pod volume backup controller.
 func NewPodVolumeBackupController(
 	logger logrus.FieldLogger,
 	podVolumeBackupInformer informers.PodVolumeBackupInformer,
-	podVolumeBackupClient arkv1client.PodVolumeBackupsGetter,
+	podVolumeBackupClient velerov1client.PodVolumeBackupsGetter,
 	podInformer cache.SharedIndexInformer,
 	secretInformer cache.SharedIndexInformer,
 	pvcInformer corev1informers.PersistentVolumeClaimInformer,
+	pvInformer corev1informers.PersistentVolumeInformer,
 	backupLocationInformer informers.BackupStorageLocationInformer,
 	nodeName string,
 ) Interface {
@@ -75,10 +80,12 @@ func NewPodVolumeBackupController(
 		podLister:             corev1listers.NewPodLister(podInformer.GetIndexer()),
 		secretLister:          corev1listers.NewSecretLister(secretInformer.GetIndexer()),
 		pvcLister:             pvcInformer.Lister(),
+		pvLister:              pvInformer.Lister(),
 		backupLocationLister:  backupLocationInformer.Lister(),
 		nodeName:              nodeName,
 
 		fileSystem: filesystem.NewFileSystem(),
+		clock:      &clock.RealClock{},
 	}
 
 	c.syncHandler = c.processQueueItem
@@ -103,7 +110,7 @@ func NewPodVolumeBackupController(
 }
 
 func (c *podVolumeBackupController) pvbHandler(obj interface{}) {
-	req := obj.(*arkv1api.PodVolumeBackup)
+	req := obj.(*velerov1api.PodVolumeBackup)
 
 	// only enqueue items for this node
 	if req.Spec.Node != c.nodeName {
@@ -112,7 +119,7 @@ func (c *podVolumeBackupController) pvbHandler(obj interface{}) {
 
 	log := loggerForPodVolumeBackup(c.logger, req)
 
-	if req.Status.Phase != "" && req.Status.Phase != arkv1api.PodVolumeBackupPhaseNew {
+	if req.Status.Phase != "" && req.Status.Phase != velerov1api.PodVolumeBackupPhaseNew {
 		log.Debug("Backup is not new, not enqueuing")
 		return
 	}
@@ -142,7 +149,7 @@ func (c *podVolumeBackupController) processQueueItem(key string) error {
 
 	// only process new items
 	switch req.Status.Phase {
-	case "", arkv1api.PodVolumeBackupPhaseNew:
+	case "", velerov1api.PodVolumeBackupPhaseNew:
 	default:
 		return nil
 	}
@@ -152,7 +159,7 @@ func (c *podVolumeBackupController) processQueueItem(key string) error {
 	return c.processBackupFunc(reqCopy)
 }
 
-func loggerForPodVolumeBackup(baseLogger logrus.FieldLogger, req *arkv1api.PodVolumeBackup) logrus.FieldLogger {
+func loggerForPodVolumeBackup(baseLogger logrus.FieldLogger, req *velerov1api.PodVolumeBackup) logrus.FieldLogger {
 	log := baseLogger.WithFields(logrus.Fields{
 		"namespace": req.Namespace,
 		"name":      req.Name,
@@ -165,7 +172,7 @@ func loggerForPodVolumeBackup(baseLogger logrus.FieldLogger, req *arkv1api.PodVo
 	return log
 }
 
-func (c *podVolumeBackupController) processBackup(req *arkv1api.PodVolumeBackup) error {
+func (c *podVolumeBackupController) processBackup(req *velerov1api.PodVolumeBackup) error {
 	log := loggerForPodVolumeBackup(c.logger, req)
 
 	log.Info("Backup starting")
@@ -173,9 +180,12 @@ func (c *podVolumeBackupController) processBackup(req *arkv1api.PodVolumeBackup)
 	var err error
 
 	// update status to InProgress
-	req, err = c.patchPodVolumeBackup(req, updatePhaseFunc(arkv1api.PodVolumeBackupPhaseInProgress))
+	req, err = c.patchPodVolumeBackup(req, func(r *velerov1api.PodVolumeBackup) {
+		r.Status.Phase = velerov1api.PodVolumeBackupPhaseInProgress
+		r.Status.StartTimestamp = &metav1.Time{Time: c.clock.Now()}
+	})
 	if err != nil {
-		log.WithError(err).Error("Error setting phase to InProgress")
+		log.WithError(err).Error("Error setting PodVolumeBackup StartTimestamp and phase to InProgress")
 		return errors.WithStack(err)
 	}
 
@@ -185,7 +195,7 @@ func (c *podVolumeBackupController) processBackup(req *arkv1api.PodVolumeBackup)
 		return c.fail(req, errors.Wrap(err, "error getting pod").Error(), log)
 	}
 
-	volumeDir, err := kube.GetVolumeDirectory(pod, req.Spec.Volume, c.pvcLister)
+	volumeDir, err := kube.GetVolumeDirectory(pod, req.Spec.Volume, c.pvcLister, c.pvLister)
 	if err != nil {
 		log.WithError(err).Error("Error getting volume directory name")
 		return c.fail(req, errors.Wrap(err, "error getting volume directory name").Error(), log)
@@ -217,37 +227,70 @@ func (c *podVolumeBackupController) processBackup(req *arkv1api.PodVolumeBackup)
 		req.Spec.Tags,
 	)
 
-	// if this is azure, set resticCmd.Env appropriately
+	// Running restic command might need additional provider specific environment variables. Based on the provider, we
+	// set resticCmd.Env appropriately (currently for Azure and S3 based backuplocations)
 	var env []string
 	if strings.HasPrefix(req.Spec.RepoIdentifier, "azure") {
 		if env, err = restic.AzureCmdEnv(c.backupLocationLister, req.Namespace, req.Spec.BackupStorageLocation); err != nil {
 			return c.fail(req, errors.Wrap(err, "error setting restic cmd env").Error(), log)
 		}
 		resticCmd.Env = env
+	} else if strings.HasPrefix(req.Spec.RepoIdentifier, "s3") {
+		if env, err = restic.S3CmdEnv(c.backupLocationLister, req.Namespace, req.Spec.BackupStorageLocation); err != nil {
+			return c.fail(req, errors.Wrap(err, "error setting restic cmd env").Error(), log)
+		}
+		resticCmd.Env = env
+	}
+
+	// If this is a PVC, look for the most recent completed pod volume backup for it and get
+	// its restic snapshot ID to use as the value of the `--parent` flag. Without this,
+	// if the pod using the PVC (and therefore the directory path under /host_pods/) has
+	// changed since the PVC's last backup, restic will not be able to identify a suitable
+	// parent snapshot to use, and will have to do a full rescan of the contents of the PVC.
+	if pvcUID, ok := req.Labels[velerov1api.PVCUIDLabel]; ok {
+		parentSnapshotID := getParentSnapshot(log, pvcUID, c.podVolumeBackupLister.PodVolumeBackups(req.Namespace))
+		if parentSnapshotID == "" {
+			log.Info("No parent snapshot found for PVC, not using --parent flag for this backup")
+		} else {
+			log.WithField("parentSnapshotID", parentSnapshotID).Info("Setting --parent flag for this backup")
+			resticCmd.ExtraFlags = append(resticCmd.ExtraFlags, fmt.Sprintf("--parent=%s", parentSnapshotID))
+		}
 	}
 
 	var stdout, stderr string
 
-	if stdout, stderr, err = arkexec.RunCommand(resticCmd.Cmd()); err != nil {
-		log.WithError(errors.WithStack(err)).Errorf("Error running command=%s, stdout=%s, stderr=%s", resticCmd.String(), stdout, stderr)
-		return c.fail(req, fmt.Sprintf("error running restic backup, stderr=%s: %s", stderr, err.Error()), log)
+	var emptySnapshot bool
+	if stdout, stderr, err = restic.RunBackup(resticCmd, log, c.updateBackupProgressFunc(req, log)); err != nil {
+		if strings.Contains(stderr, "snapshot is empty") {
+			emptySnapshot = true
+		} else {
+			log.WithError(errors.WithStack(err)).Errorf("Error running command=%s, stdout=%s, stderr=%s", resticCmd.String(), stdout, stderr)
+			return c.fail(req, fmt.Sprintf("error running restic backup, stderr=%s: %s", stderr, err.Error()), log)
+		}
 	}
 	log.Debugf("Ran command=%s, stdout=%s, stderr=%s", resticCmd.String(), stdout, stderr)
 
-	snapshotID, err := restic.GetSnapshotID(req.Spec.RepoIdentifier, file, req.Spec.Tags, env)
-	if err != nil {
-		log.WithError(err).Error("Error getting SnapshotID")
-		return c.fail(req, errors.Wrap(err, "error getting snapshot id").Error(), log)
+	var snapshotID string
+	if !emptySnapshot {
+		snapshotID, err = restic.GetSnapshotID(req.Spec.RepoIdentifier, file, req.Spec.Tags, env)
+		if err != nil {
+			log.WithError(err).Error("Error getting SnapshotID")
+			return c.fail(req, errors.Wrap(err, "error getting snapshot id").Error(), log)
+		}
 	}
 
 	// update status to Completed with path & snapshot id
-	req, err = c.patchPodVolumeBackup(req, func(r *arkv1api.PodVolumeBackup) {
+	req, err = c.patchPodVolumeBackup(req, func(r *velerov1api.PodVolumeBackup) {
 		r.Status.Path = path
+		r.Status.Phase = velerov1api.PodVolumeBackupPhaseCompleted
 		r.Status.SnapshotID = snapshotID
-		r.Status.Phase = arkv1api.PodVolumeBackupPhaseCompleted
+		r.Status.CompletionTimestamp = &metav1.Time{Time: c.clock.Now()}
+		if emptySnapshot {
+			r.Status.Message = "volume was empty so no snapshot was taken"
+		}
 	})
 	if err != nil {
-		log.WithError(err).Error("Error setting phase to Completed")
+		log.WithError(err).Error("Error setting PodVolumeBackup phase to Completed")
 		return err
 	}
 
@@ -256,7 +299,46 @@ func (c *podVolumeBackupController) processBackup(req *arkv1api.PodVolumeBackup)
 	return nil
 }
 
-func (c *podVolumeBackupController) patchPodVolumeBackup(req *arkv1api.PodVolumeBackup, mutate func(*arkv1api.PodVolumeBackup)) (*arkv1api.PodVolumeBackup, error) {
+// getParentSnapshot finds the most recent completed pod volume backup for the specified PVC and returns its
+// restic snapshot ID. Any errors encountered are logged but not returned since they do not prevent a backup
+// from proceeding.
+func getParentSnapshot(log logrus.FieldLogger, pvcUID string, podVolumeBackupLister listers.PodVolumeBackupNamespaceLister) string {
+	log = log.WithField("pvcUID", pvcUID)
+	log.Infof("Looking for most recent completed pod volume backup for this PVC")
+
+	pvcBackups, err := podVolumeBackupLister.List(labels.SelectorFromSet(map[string]string{velerov1api.PVCUIDLabel: pvcUID}))
+	if err != nil {
+		log.WithError(errors.WithStack(err)).Error("Error listing pod volume backups for PVC")
+		return ""
+	}
+
+	// go through all the pod volume backups for the PVC and look for the most recent completed one
+	// to use as the parent.
+	var mostRecentBackup *velerov1api.PodVolumeBackup
+	for _, backup := range pvcBackups {
+		if backup.Status.Phase != velerov1api.PodVolumeBackupPhaseCompleted {
+			continue
+		}
+
+		if mostRecentBackup == nil || backup.Status.StartTimestamp.After(mostRecentBackup.Status.StartTimestamp.Time) {
+			mostRecentBackup = backup
+		}
+	}
+
+	if mostRecentBackup == nil {
+		log.Info("No completed pod volume backup found for PVC")
+		return ""
+	}
+
+	log.WithFields(map[string]interface{}{
+		"parentPodVolumeBackup": mostRecentBackup.Name,
+		"parentSnapshotID":      mostRecentBackup.Status.SnapshotID,
+	}).Info("Found most recent completed pod volume backup for PVC")
+
+	return mostRecentBackup.Status.SnapshotID
+}
+
+func (c *podVolumeBackupController) patchPodVolumeBackup(req *velerov1api.PodVolumeBackup, mutate func(*velerov1api.PodVolumeBackup)) (*velerov1api.PodVolumeBackup, error) {
 	// Record original json
 	oldData, err := json.Marshal(req)
 	if err != nil {
@@ -285,21 +367,28 @@ func (c *podVolumeBackupController) patchPodVolumeBackup(req *arkv1api.PodVolume
 	return req, nil
 }
 
-func (c *podVolumeBackupController) fail(req *arkv1api.PodVolumeBackup, msg string, log logrus.FieldLogger) error {
-	if _, err := c.patchPodVolumeBackup(req, func(r *arkv1api.PodVolumeBackup) {
-		r.Status.Phase = arkv1api.PodVolumeBackupPhaseFailed
+// updateBackupProgressFunc returns a func that takes progress info and patches
+// the PVB with the new progress
+func (c *podVolumeBackupController) updateBackupProgressFunc(req *velerov1api.PodVolumeBackup, log logrus.FieldLogger) func(velerov1api.PodVolumeOperationProgress) {
+	return func(progress velerov1api.PodVolumeOperationProgress) {
+		if _, err := c.patchPodVolumeBackup(req, func(r *velerov1api.PodVolumeBackup) {
+			r.Status.Progress = progress
+		}); err != nil {
+			log.WithError(err).Error("error updating PodVolumeBackup progress")
+		}
+	}
+}
+
+func (c *podVolumeBackupController) fail(req *velerov1api.PodVolumeBackup, msg string, log logrus.FieldLogger) error {
+	if _, err := c.patchPodVolumeBackup(req, func(r *velerov1api.PodVolumeBackup) {
+		r.Status.Phase = velerov1api.PodVolumeBackupPhaseFailed
 		r.Status.Message = msg
+		r.Status.CompletionTimestamp = &metav1.Time{Time: c.clock.Now()}
 	}); err != nil {
-		log.WithError(err).Error("Error setting phase to Failed")
+		log.WithError(err).Error("Error setting PodVolumeBackup phase to Failed")
 		return err
 	}
 	return nil
-}
-
-func updatePhaseFunc(phase arkv1api.PodVolumeBackupPhase) func(r *arkv1api.PodVolumeBackup) {
-	return func(r *arkv1api.PodVolumeBackup) {
-		r.Status.Phase = phase
-	}
 }
 
 func singlePathMatch(path string) (string, error) {

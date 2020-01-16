@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,11 +26,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/tools/cache"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	pkgbackup "github.com/heptio/ark/pkg/backup"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
-	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
+	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/label"
 )
 
 const (
@@ -43,7 +44,8 @@ type gcController struct {
 
 	backupLister              listers.BackupLister
 	deleteBackupRequestLister listers.DeleteBackupRequestLister
-	deleteBackupRequestClient arkv1client.DeleteBackupRequestsGetter
+	deleteBackupRequestClient velerov1client.DeleteBackupRequestsGetter
+	backupLocationLister      listers.BackupStorageLocationLister
 
 	clock clock.Clock
 }
@@ -53,7 +55,8 @@ func NewGCController(
 	logger logrus.FieldLogger,
 	backupInformer informers.BackupInformer,
 	deleteBackupRequestInformer informers.DeleteBackupRequestInformer,
-	deleteBackupRequestClient arkv1client.DeleteBackupRequestsGetter,
+	deleteBackupRequestClient velerov1client.DeleteBackupRequestsGetter,
+	backupLocationInformer informers.BackupStorageLocationInformer,
 ) Interface {
 	c := &gcController{
 		genericController:         newGenericController("gc-controller", logger),
@@ -61,12 +64,14 @@ func NewGCController(
 		backupLister:              backupInformer.Lister(),
 		deleteBackupRequestLister: deleteBackupRequestInformer.Lister(),
 		deleteBackupRequestClient: deleteBackupRequestClient,
+		backupLocationLister:      backupLocationInformer.Lister(),
 	}
 
 	c.syncHandler = c.processQueueItem
 	c.cacheSyncWaiters = append(c.cacheSyncWaiters,
 		backupInformer.Informer().HasSynced,
 		deleteBackupRequestInformer.Informer().HasSynced,
+		backupLocationInformer.Informer().HasSynced,
 	)
 
 	c.resyncPeriod = GCSyncPeriod
@@ -118,23 +123,35 @@ func (c *gcController) processQueueItem(key string) error {
 	log = c.logger.WithFields(
 		logrus.Fields{
 			"backup":     key,
-			"expiration": backup.Status.Expiration.Time,
+			"expiration": backup.Status.Expiration,
 		},
 	)
 
 	now := c.clock.Now()
 
-	expiration := backup.Status.Expiration.Time
-	if expiration.IsZero() || expiration.After(now) {
+	if backup.Status.Expiration == nil || backup.Status.Expiration.After(now) {
 		log.Debug("Backup has not expired yet, skipping")
 		return nil
 	}
 
 	log.Info("Backup has expired")
 
+	loc, err := c.backupLocationLister.BackupStorageLocations(ns).Get(backup.Spec.StorageLocation)
+	if apierrors.IsNotFound(err) {
+		log.Warnf("Backup cannot be garbage-collected because backup storage location %s does not exist", backup.Spec.StorageLocation)
+	}
+	if err != nil {
+		return errors.Wrap(err, "error getting backup storage location")
+	}
+
+	if loc.Spec.AccessMode == velerov1api.BackupStorageLocationAccessModeReadOnly {
+		log.Infof("Backup cannot be garbage-collected because backup storage location %s is currently in read-only mode", loc.Name)
+		return nil
+	}
+
 	selector := labels.SelectorFromSet(labels.Set(map[string]string{
-		arkv1api.BackupNameLabel: backup.Name,
-		arkv1api.BackupUIDLabel:  string(backup.UID),
+		velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
+		velerov1api.BackupUIDLabel:  string(backup.UID),
 	}))
 
 	dbrs, err := c.deleteBackupRequestLister.DeleteBackupRequests(ns).List(selector)
@@ -146,7 +163,7 @@ func (c *gcController) processQueueItem(key string) error {
 	// another one
 	for _, dbr := range dbrs {
 		switch dbr.Status.Phase {
-		case "", arkv1api.DeleteBackupRequestPhaseNew, arkv1api.DeleteBackupRequestPhaseInProgress:
+		case "", velerov1api.DeleteBackupRequestPhaseNew, velerov1api.DeleteBackupRequestPhaseInProgress:
 			log.Info("Backup already has a pending deletion request")
 			return nil
 		}

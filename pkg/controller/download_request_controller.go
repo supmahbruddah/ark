@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,36 +30,36 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
-	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
-	"github.com/heptio/ark/pkg/persistence"
-	"github.com/heptio/ark/pkg/plugin"
-	"github.com/heptio/ark/pkg/util/kube"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
+	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/persistence"
+	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 type downloadRequestController struct {
 	*genericController
 
-	downloadRequestClient arkv1client.DownloadRequestsGetter
+	downloadRequestClient velerov1client.DownloadRequestsGetter
 	downloadRequestLister listers.DownloadRequestLister
 	restoreLister         listers.RestoreLister
 	clock                 clock.Clock
 	backupLocationLister  listers.BackupStorageLocationLister
 	backupLister          listers.BackupLister
-	newPluginManager      func(logrus.FieldLogger) plugin.Manager
+	newPluginManager      func(logrus.FieldLogger) clientmgmt.Manager
 	newBackupStore        func(*v1.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error)
 }
 
 // NewDownloadRequestController creates a new DownloadRequestController.
 func NewDownloadRequestController(
-	downloadRequestClient arkv1client.DownloadRequestsGetter,
+	downloadRequestClient velerov1client.DownloadRequestsGetter,
 	downloadRequestInformer informers.DownloadRequestInformer,
 	restoreInformer informers.RestoreInformer,
 	backupLocationInformer informers.BackupStorageLocationInformer,
 	backupInformer informers.BackupInformer,
-	newPluginManager func(logrus.FieldLogger) plugin.Manager,
+	newPluginManager func(logrus.FieldLogger) clientmgmt.Manager,
 	logger logrus.FieldLogger,
 ) Interface {
 	c := &downloadRequestController{
@@ -184,7 +184,7 @@ func (c *downloadRequestController) generatePreSignedURL(downloadRequest *v1.Dow
 	}
 
 	update.Status.Phase = v1.DownloadRequestPhaseProcessed
-	update.Status.Expiration = metav1.NewTime(c.clock.Now().Add(persistence.DownloadURLTTL))
+	update.Status.Expiration = &metav1.Time{Time: c.clock.Now().Add(persistence.DownloadURLTTL)}
 
 	_, err = patchDownloadRequest(downloadRequest, update, c.downloadRequestClient)
 	return errors.WithStack(err)
@@ -223,7 +223,7 @@ func (c *downloadRequestController) resync() {
 	}
 }
 
-func patchDownloadRequest(original, updated *v1.DownloadRequest, client arkv1client.DownloadRequestsGetter) (*v1.DownloadRequest, error) {
+func patchDownloadRequest(original, updated *v1.DownloadRequest, client velerov1client.DownloadRequestsGetter) (*v1.DownloadRequest, error) {
 	origBytes, err := json.Marshal(original)
 	if err != nil {
 		return nil, errors.Wrap(err, "error marshalling original download request")

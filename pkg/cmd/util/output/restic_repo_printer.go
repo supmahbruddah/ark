@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018, 2020 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,34 +17,34 @@ limitations under the License.
 package output
 
 import (
-	"fmt"
-	"io"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
-	"k8s.io/kubernetes/pkg/printers"
-
-	"github.com/heptio/ark/pkg/apis/ark/v1"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 )
 
 var (
-	resticRepoColumns = []string{"NAME", "STATUS", "LAST MAINTENANCE"}
+	resticRepoColumns = []metav1.TableColumnDefinition{
+		// name needs Type and Format defined for the decorator to identify it:
+		// https://github.com/kubernetes/kubernetes/blob/v1.15.3/pkg/printers/tableprinter.go#L204
+		{Name: "Name", Type: "string", Format: "name"},
+		{Name: "Status"},
+		{Name: "Last Maintenance"},
+	}
 )
 
-func printResticRepoList(list *v1.ResticRepositoryList, w io.Writer, options printers.PrintOptions) error {
+func printResticRepoList(list *v1.ResticRepositoryList) []metav1.TableRow {
+	rows := make([]metav1.TableRow, 0, len(list.Items))
+
 	for i := range list.Items {
-		if err := printResticRepo(&list.Items[i], w, options); err != nil {
-			return err
-		}
+		rows = append(rows, printResticRepo(&list.Items[i])...)
 	}
-	return nil
+	return rows
 }
 
-func printResticRepo(repo *v1.ResticRepository, w io.Writer, options printers.PrintOptions) error {
-	name := printers.FormatResourceName(options.Kind, repo.Name, options.WithKind)
-
-	if options.WithNamespace {
-		if _, err := fmt.Fprintf(w, "%s\t", repo.Namespace); err != nil {
-			return err
-		}
+func printResticRepo(repo *v1.ResticRepository) []metav1.TableRow {
+	row := metav1.TableRow{
+		Object: runtime.RawExtension{Object: repo},
 	}
 
 	status := repo.Status.Phase
@@ -57,20 +57,11 @@ func printResticRepo(repo *v1.ResticRepository, w io.Writer, options printers.Pr
 		lastMaintenance = "<never>"
 	}
 
-	if _, err := fmt.Fprintf(
-		w,
-		"%s\t%s\t%s",
-		name,
+	row.Cells = append(row.Cells,
+		repo.Name,
 		status,
 		lastMaintenance,
-	); err != nil {
-		return err
-	}
+	)
 
-	if _, err := fmt.Fprint(w, printers.AppendLabels(repo.Labels, options.ColumnLabels)); err != nil {
-		return err
-	}
-
-	_, err := fmt.Fprint(w, printers.AppendAllLabels(options.ShowLabels, repo.Labels))
-	return err
+	return []metav1.TableRow{row}
 }

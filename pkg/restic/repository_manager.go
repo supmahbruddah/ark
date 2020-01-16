@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,28 +25,35 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	clientset "github.com/heptio/ark/pkg/generated/clientset/versioned"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	arkv1informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
-	arkv1listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
-	arkexec "github.com/heptio/ark/pkg/util/exec"
-	"github.com/heptio/ark/pkg/util/filesystem"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	clientset "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	velerov1informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
+	velerov1listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	veleroexec "github.com/vmware-tanzu/velero/pkg/util/exec"
+	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
 )
 
 // RepositoryManager executes commands against restic repositories.
 type RepositoryManager interface {
 	// InitRepo initializes a repo with the specified name and identifier.
-	InitRepo(repo *arkv1api.ResticRepository) error
+	InitRepo(repo *velerov1api.ResticRepository) error
 
-	// CheckRepo checks the specified repo for errors.
-	CheckRepo(repo *arkv1api.ResticRepository) error
+	// ConnectToRepo runs the 'restic snapshots' command against the
+	// specified repo, and returns an error if it fails. This is
+	// intended to be used to ensure that the repo exists/can be
+	// authenticated to.
+	ConnectToRepo(repo *velerov1api.ResticRepository) error
 
 	// PruneRepo deletes unused data from a repo.
-	PruneRepo(repo *arkv1api.ResticRepository) error
+	PruneRepo(repo *velerov1api.ResticRepository) error
+
+	// UnlockRepo removes stale locks from a repo.
+	UnlockRepo(repo *velerov1api.ResticRepository) error
 
 	// Forget removes a snapshot from the list of
 	// available snapshots in a repo.
@@ -60,51 +67,57 @@ type RepositoryManager interface {
 // BackupperFactory can construct restic backuppers.
 type BackupperFactory interface {
 	// NewBackupper returns a restic backupper for use during a single
-	// Ark backup.
-	NewBackupper(context.Context, *arkv1api.Backup) (Backupper, error)
+	// Velero backup.
+	NewBackupper(context.Context, *velerov1api.Backup) (Backupper, error)
 }
 
 // RestorerFactory can construct restic restorers.
 type RestorerFactory interface {
 	// NewRestorer returns a restic restorer for use during a single
-	// Ark restore.
-	NewRestorer(context.Context, *arkv1api.Restore) (Restorer, error)
+	// Velero restore.
+	NewRestorer(context.Context, *velerov1api.Restore) (Restorer, error)
 }
 
 type repositoryManager struct {
 	namespace                    string
-	arkClient                    clientset.Interface
+	veleroClient                 clientset.Interface
 	secretsLister                corev1listers.SecretLister
-	repoLister                   arkv1listers.ResticRepositoryLister
+	repoLister                   velerov1listers.ResticRepositoryLister
 	repoInformerSynced           cache.InformerSynced
-	backupLocationLister         arkv1listers.BackupStorageLocationLister
+	backupLocationLister         velerov1listers.BackupStorageLocationLister
 	backupLocationInformerSynced cache.InformerSynced
 	log                          logrus.FieldLogger
 	repoLocker                   *repoLocker
 	repoEnsurer                  *repositoryEnsurer
 	fileSystem                   filesystem.Interface
 	ctx                          context.Context
+	pvcClient                    corev1client.PersistentVolumeClaimsGetter
+	pvClient                     corev1client.PersistentVolumesGetter
 }
 
 // NewRepositoryManager constructs a RepositoryManager.
 func NewRepositoryManager(
 	ctx context.Context,
 	namespace string,
-	arkClient clientset.Interface,
+	veleroClient clientset.Interface,
 	secretsInformer cache.SharedIndexInformer,
-	repoInformer arkv1informers.ResticRepositoryInformer,
-	repoClient arkv1client.ResticRepositoriesGetter,
-	backupLocationInformer arkv1informers.BackupStorageLocationInformer,
+	repoInformer velerov1informers.ResticRepositoryInformer,
+	repoClient velerov1client.ResticRepositoriesGetter,
+	backupLocationInformer velerov1informers.BackupStorageLocationInformer,
+	pvcClient corev1client.PersistentVolumeClaimsGetter,
+	pvClient corev1client.PersistentVolumesGetter,
 	log logrus.FieldLogger,
 ) (RepositoryManager, error) {
 	rm := &repositoryManager{
 		namespace:                    namespace,
-		arkClient:                    arkClient,
+		veleroClient:                 veleroClient,
 		secretsLister:                corev1listers.NewSecretLister(secretsInformer.GetIndexer()),
 		repoLister:                   repoInformer.Lister(),
 		repoInformerSynced:           repoInformer.Informer().HasSynced,
 		backupLocationLister:         backupLocationInformer.Lister(),
 		backupLocationInformerSynced: backupLocationInformer.Informer().HasSynced,
+		pvcClient:                    pvcClient,
+		pvClient:                     pvClient,
 		log:                          log,
 		ctx:                          ctx,
 
@@ -120,18 +133,18 @@ func NewRepositoryManager(
 	return rm, nil
 }
 
-func (rm *repositoryManager) NewBackupper(ctx context.Context, backup *arkv1api.Backup) (Backupper, error) {
-	informer := arkv1informers.NewFilteredPodVolumeBackupInformer(
-		rm.arkClient,
+func (rm *repositoryManager) NewBackupper(ctx context.Context, backup *velerov1api.Backup) (Backupper, error) {
+	informer := velerov1informers.NewFilteredPodVolumeBackupInformer(
+		rm.veleroClient,
 		backup.Namespace,
 		0,
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 		func(opts *metav1.ListOptions) {
-			opts.LabelSelector = fmt.Sprintf("%s=%s", arkv1api.BackupUIDLabel, backup.UID)
+			opts.LabelSelector = fmt.Sprintf("%s=%s", velerov1api.BackupUIDLabel, backup.UID)
 		},
 	)
 
-	b := newBackupper(ctx, rm, rm.repoEnsurer, informer, rm.log)
+	b := newBackupper(ctx, rm, rm.repoEnsurer, informer, rm.pvcClient, rm.pvClient, rm.log)
 
 	go informer.Run(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced, rm.repoInformerSynced) {
@@ -141,14 +154,14 @@ func (rm *repositoryManager) NewBackupper(ctx context.Context, backup *arkv1api.
 	return b, nil
 }
 
-func (rm *repositoryManager) NewRestorer(ctx context.Context, restore *arkv1api.Restore) (Restorer, error) {
-	informer := arkv1informers.NewFilteredPodVolumeRestoreInformer(
-		rm.arkClient,
+func (rm *repositoryManager) NewRestorer(ctx context.Context, restore *velerov1api.Restore) (Restorer, error) {
+	informer := velerov1informers.NewFilteredPodVolumeRestoreInformer(
+		rm.veleroClient,
 		restore.Namespace,
 		0,
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 		func(opts *metav1.ListOptions) {
-			opts.LabelSelector = fmt.Sprintf("%s=%s", arkv1api.RestoreUIDLabel, restore.UID)
+			opts.LabelSelector = fmt.Sprintf("%s=%s", velerov1api.RestoreUIDLabel, restore.UID)
 		},
 	)
 
@@ -162,7 +175,7 @@ func (rm *repositoryManager) NewRestorer(ctx context.Context, restore *arkv1api.
 	return r, nil
 }
 
-func (rm *repositoryManager) InitRepo(repo *arkv1api.ResticRepository) error {
+func (rm *repositoryManager) InitRepo(repo *velerov1api.ResticRepository) error {
 	// restic init requires an exclusive lock
 	rm.repoLocker.LockExclusive(repo.Name)
 	defer rm.repoLocker.UnlockExclusive(repo.Name)
@@ -170,20 +183,34 @@ func (rm *repositoryManager) InitRepo(repo *arkv1api.ResticRepository) error {
 	return rm.exec(InitCommand(repo.Spec.ResticIdentifier), repo.Spec.BackupStorageLocation)
 }
 
-func (rm *repositoryManager) CheckRepo(repo *arkv1api.ResticRepository) error {
-	// restic check requires an exclusive lock
-	rm.repoLocker.LockExclusive(repo.Name)
-	defer rm.repoLocker.UnlockExclusive(repo.Name)
+func (rm *repositoryManager) ConnectToRepo(repo *velerov1api.ResticRepository) error {
+	// restic snapshots requires a non-exclusive lock
+	rm.repoLocker.Lock(repo.Name)
+	defer rm.repoLocker.Unlock(repo.Name)
 
-	return rm.exec(CheckCommand(repo.Spec.ResticIdentifier), repo.Spec.BackupStorageLocation)
+	snapshotsCmd := SnapshotsCommand(repo.Spec.ResticIdentifier)
+	// use the '--last' flag to minimize the amount of data fetched since
+	// we're just validating that the repo exists and can be authenticated
+	// to.
+	snapshotsCmd.ExtraFlags = append(snapshotsCmd.ExtraFlags, "--last")
+
+	return rm.exec(snapshotsCmd, repo.Spec.BackupStorageLocation)
 }
 
-func (rm *repositoryManager) PruneRepo(repo *arkv1api.ResticRepository) error {
+func (rm *repositoryManager) PruneRepo(repo *velerov1api.ResticRepository) error {
 	// restic prune requires an exclusive lock
 	rm.repoLocker.LockExclusive(repo.Name)
 	defer rm.repoLocker.UnlockExclusive(repo.Name)
 
 	return rm.exec(PruneCommand(repo.Spec.ResticIdentifier), repo.Spec.BackupStorageLocation)
+}
+
+func (rm *repositoryManager) UnlockRepo(repo *velerov1api.ResticRepository) error {
+	// restic unlock requires a non-exclusive lock
+	rm.repoLocker.Lock(repo.Name)
+	defer rm.repoLocker.Unlock(repo.Name)
+
+	return rm.exec(UnlockCommand(repo.Spec.ResticIdentifier), repo.Spec.BackupStorageLocation)
 }
 
 func (rm *repositoryManager) Forget(ctx context.Context, snapshot SnapshotIdentifier) error {
@@ -227,9 +254,19 @@ func (rm *repositoryManager) exec(cmd *Command, backupLocation string) error {
 			return err
 		}
 		cmd.Env = env
+	} else if strings.HasPrefix(cmd.RepoIdentifier, "s3") {
+		if !cache.WaitForCacheSync(rm.ctx.Done(), rm.backupLocationInformerSynced) {
+			return errors.New("timed out waiting for cache to sync")
+		}
+
+		env, err := S3CmdEnv(rm.backupLocationLister, rm.namespace, backupLocation)
+		if err != nil {
+			return err
+		}
+		cmd.Env = env
 	}
 
-	stdout, stderr, err := arkexec.RunCommand(cmd.Cmd())
+	stdout, stderr, err := veleroexec.RunCommand(cmd.Cmd())
 	rm.log.WithFields(logrus.Fields{
 		"repository": cmd.RepoName(),
 		"command":    cmd.String(),

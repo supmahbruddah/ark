@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright 2017 the Heptio Ark contributors.
+# Copyright 2017 the Velero contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,12 +28,22 @@ if [[ ! -d "${GOPATH}/src/k8s.io/code-generator" ]]; then
   exit 1
 fi
 
-cd ${GOPATH}/src/k8s.io/code-generator
+if [[ ! -d "${GOPATH}/src/sigs.k8s.io/controller-tools" ]]; then
+  echo "sigs.k8s.io/controller-tools missing from GOPATH"
+  exit 1
+fi
 
-./generate-groups.sh \
+${GOPATH}/src/k8s.io/code-generator/generate-groups.sh \
   all \
-  github.com/heptio/ark/pkg/generated \
-  github.com/heptio/ark/pkg/apis \
-  ark:v1 \
-  --go-header-file ${GOPATH}/src/github.com/heptio/ark/hack/boilerplate.go.txt \
+  github.com/vmware-tanzu/velero/pkg/generated \
+  github.com/vmware-tanzu/velero/pkg/apis \
+  "velero:v1" \
+  --go-header-file ${GOPATH}/src/github.com/vmware-tanzu/velero/hack/boilerplate.go.txt \
   $@
+
+go run ${GOPATH}/src/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go \
+  crd \
+  output:dir=pkg/generated/crds/manifests \
+  paths=./pkg/apis/velero/v1/...
+
+go generate ./pkg/generated/crds

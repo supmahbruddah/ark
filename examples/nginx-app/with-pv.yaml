@@ -1,4 +1,4 @@
-# Copyright 2017 the Heptio Ark contributors.
+# Copyright 2017 the Velero contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +29,8 @@ metadata:
   labels:
     app: nginx
 spec:
-  storageClassName: <YOUR_STORAGE_CLASS_NAME>
+  # Optional:
+  # storageClassName: <YOUR_STORAGE_CLASS_NAME>
   accessModes:
     - ReadWriteOnce
   resources:
@@ -37,29 +38,32 @@ spec:
       storage: 50Mi
 
 ---
-apiVersion: apps/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: nginx-deployment
   namespace: nginx-example
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
   template:
     metadata:
       labels:
         app: nginx
       annotations:
-        pre.hook.backup.ark.heptio.com/container: fsfreeze
-        pre.hook.backup.ark.heptio.com/command: '["/sbin/fsfreeze", "--freeze", "/var/log/nginx"]'
-        post.hook.backup.ark.heptio.com/container: fsfreeze
-        post.hook.backup.ark.heptio.com/command: '["/sbin/fsfreeze", "--unfreeze", "/var/log/nginx"]'
+        pre.hook.backup.velero.io/container: fsfreeze
+        pre.hook.backup.velero.io/command: '["/sbin/fsfreeze", "--freeze", "/var/log/nginx"]'
+        post.hook.backup.velero.io/container: fsfreeze
+        post.hook.backup.velero.io/command: '["/sbin/fsfreeze", "--unfreeze", "/var/log/nginx"]'
     spec:
       volumes:
         - name: nginx-logs
           persistentVolumeClaim:
            claimName: nginx-logs
       containers:
-      - image: nginx:1.7.9
+      - image: nginx:1.17.6
         name: nginx
         ports:
         - containerPort: 80
@@ -67,7 +71,7 @@ spec:
           - mountPath: "/var/log/nginx"
             name: nginx-logs
             readOnly: false
-      - image: gcr.io/heptio-images/fsfreeze-pause:latest
+      - image: ubuntu:bionic
         name: fsfreeze
         securityContext:
           privileged: true
@@ -75,7 +79,12 @@ spec:
           - mountPath: "/var/log/nginx"
             name: nginx-logs
             readOnly: false
+        command:
+          - "/bin/bash"
+          - "-c"
+          - "sleep infinity"
 
+  
 ---
 apiVersion: v1
 kind: Service

@@ -7,7 +7,6 @@
 _obj
 _test
 _output
-config
 
 # Architecture specific extensions/prefixes
 *.[568vq]
@@ -27,7 +26,7 @@ _testmain.go
 
 debug
 
-/ark
+/velero
 .idea/
 
 .container-*
@@ -38,6 +37,13 @@ debug
 .vscode
 *.diff
 
-_site/
+# Jekyll compiled data
+site/_site
+site/.sass-cache
+site/.jekyll
+site/.jekyll-metadata
+site/.bundle
+site/vendor
+.ruby-version
 
 .vs

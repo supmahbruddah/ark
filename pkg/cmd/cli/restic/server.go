@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,38 +25,44 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kubeinformers "k8s.io/client-go/informers"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/heptio/ark/pkg/buildinfo"
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd"
-	"github.com/heptio/ark/pkg/cmd/util/signals"
-	"github.com/heptio/ark/pkg/controller"
-	clientset "github.com/heptio/ark/pkg/generated/clientset/versioned"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions"
-	"github.com/heptio/ark/pkg/restic"
-	"github.com/heptio/ark/pkg/util/logging"
+	"github.com/vmware-tanzu/velero/pkg/buildinfo"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/signals"
+	"github.com/vmware-tanzu/velero/pkg/controller"
+	clientset "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions"
+	"github.com/vmware-tanzu/velero/pkg/restic"
+	"github.com/vmware-tanzu/velero/pkg/util/filesystem"
+	"github.com/vmware-tanzu/velero/pkg/util/logging"
 )
 
 func NewServerCommand(f client.Factory) *cobra.Command {
 	logLevelFlag := logging.LogLevelFlag(logrus.InfoLevel)
+	formatFlag := logging.NewFormatFlag()
 
 	command := &cobra.Command{
-		Use:   "server",
-		Short: "Run the ark restic server",
-		Long:  "Run the ark restic server",
+		Use:    "server",
+		Short:  "Run the velero restic server",
+		Long:   "Run the velero restic server",
+		Hidden: true,
 		Run: func(c *cobra.Command, args []string) {
 			logLevel := logLevelFlag.Parse()
 			logrus.Infof("Setting log-level to %s", strings.ToUpper(logLevel.String()))
 
-			logger := logging.DefaultLogger(logLevel)
-			logger.Infof("Starting Ark restic server %s", buildinfo.FormattedGitSHA())
+			logger := logging.DefaultLogger(logLevel, formatFlag.Parse())
+			logger.Infof("Starting Velero restic server %s (%s)", buildinfo.Version, buildinfo.FormattedGitSHA())
 
-			s, err := newResticServer(logger, fmt.Sprintf("%s-%s", c.Parent().Name(), c.Name()))
+			f.SetBasename(fmt.Sprintf("%s-%s", c.Parent().Name(), c.Name()))
+			s, err := newResticServer(logger, f)
 			cmd.CheckError(err)
 
 			s.run()
@@ -64,36 +70,34 @@ func NewServerCommand(f client.Factory) *cobra.Command {
 	}
 
 	command.Flags().Var(logLevelFlag, "log-level", fmt.Sprintf("the level at which to log. Valid values are %s.", strings.Join(logLevelFlag.AllowedValues(), ", ")))
+	command.Flags().Var(formatFlag, "log-format", fmt.Sprintf("the format for log output. Valid values are %s.", strings.Join(formatFlag.AllowedValues(), ", ")))
 
 	return command
 }
 
 type resticServer struct {
-	kubeClient          kubernetes.Interface
-	arkClient           clientset.Interface
-	arkInformerFactory  informers.SharedInformerFactory
-	kubeInformerFactory kubeinformers.SharedInformerFactory
-	podInformer         cache.SharedIndexInformer
-	secretInformer      cache.SharedIndexInformer
-	logger              logrus.FieldLogger
-	ctx                 context.Context
-	cancelFunc          context.CancelFunc
+	kubeClient            kubernetes.Interface
+	veleroClient          clientset.Interface
+	veleroInformerFactory informers.SharedInformerFactory
+	kubeInformerFactory   kubeinformers.SharedInformerFactory
+	podInformer           cache.SharedIndexInformer
+	secretInformer        cache.SharedIndexInformer
+	logger                logrus.FieldLogger
+	ctx                   context.Context
+	cancelFunc            context.CancelFunc
+	fileSystem            filesystem.Interface
 }
 
-func newResticServer(logger logrus.FieldLogger, baseName string) (*resticServer, error) {
-	clientConfig, err := client.Config("", "", baseName)
+func newResticServer(logger logrus.FieldLogger, factory client.Factory) (*resticServer, error) {
+
+	kubeClient, err := factory.KubeClient()
 	if err != nil {
 		return nil, err
 	}
 
-	kubeClient, err := kubernetes.NewForConfig(clientConfig)
+	veleroClient, err := factory.Client()
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	arkClient, err := clientset.NewForConfig(clientConfig)
-	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 
 	// use a stand-alone pod informer because we want to use a field selector to
@@ -109,14 +113,14 @@ func newResticServer(logger logrus.FieldLogger, baseName string) (*resticServer,
 	)
 
 	// use a stand-alone secrets informer so we can filter to only the restic credentials
-	// secret(s) within the heptio-ark namespace
+	// secret(s) within the velero namespace
 	//
-	// note: using an informer to access the single secret for all ark-managed
+	// note: using an informer to access the single secret for all velero-managed
 	// restic repositories is overkill for now, but will be useful when we move
 	// to fully-encrypted backups and have unique keys per repository.
 	secretInformer := corev1informers.NewFilteredSecretInformer(
 		kubeClient,
-		os.Getenv("HEPTIO_ARK_NAMESPACE"),
+		factory.Namespace(),
 		0,
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 		func(opts *metav1.ListOptions) {
@@ -126,17 +130,24 @@ func newResticServer(logger logrus.FieldLogger, baseName string) (*resticServer,
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
-	return &resticServer{
-		kubeClient:          kubeClient,
-		arkClient:           arkClient,
-		arkInformerFactory:  informers.NewFilteredSharedInformerFactory(arkClient, 0, os.Getenv("HEPTIO_ARK_NAMESPACE"), nil),
-		kubeInformerFactory: kubeinformers.NewSharedInformerFactory(kubeClient, 0),
-		podInformer:         podInformer,
-		secretInformer:      secretInformer,
-		logger:              logger,
-		ctx:                 ctx,
-		cancelFunc:          cancelFunc,
-	}, nil
+	s := &resticServer{
+		kubeClient:            kubeClient,
+		veleroClient:          veleroClient,
+		veleroInformerFactory: informers.NewFilteredSharedInformerFactory(veleroClient, 0, factory.Namespace(), nil),
+		kubeInformerFactory:   kubeinformers.NewSharedInformerFactory(kubeClient, 0),
+		podInformer:           podInformer,
+		secretInformer:        secretInformer,
+		logger:                logger,
+		ctx:                   ctx,
+		cancelFunc:            cancelFunc,
+		fileSystem:            filesystem.NewFileSystem(),
+	}
+
+	if err := s.validatePodVolumesHostPath(); err != nil {
+		return nil, err
+	}
+
+	return s, nil
 }
 
 func (s *resticServer) run() {
@@ -148,12 +159,13 @@ func (s *resticServer) run() {
 
 	backupController := controller.NewPodVolumeBackupController(
 		s.logger,
-		s.arkInformerFactory.Ark().V1().PodVolumeBackups(),
-		s.arkClient.ArkV1(),
+		s.veleroInformerFactory.Velero().V1().PodVolumeBackups(),
+		s.veleroClient.VeleroV1(),
 		s.podInformer,
 		s.secretInformer,
 		s.kubeInformerFactory.Core().V1().PersistentVolumeClaims(),
-		s.arkInformerFactory.Ark().V1().BackupStorageLocations(),
+		s.kubeInformerFactory.Core().V1().PersistentVolumes(),
+		s.veleroInformerFactory.Velero().V1().BackupStorageLocations(),
 		os.Getenv("NODE_NAME"),
 	)
 	wg.Add(1)
@@ -164,12 +176,13 @@ func (s *resticServer) run() {
 
 	restoreController := controller.NewPodVolumeRestoreController(
 		s.logger,
-		s.arkInformerFactory.Ark().V1().PodVolumeRestores(),
-		s.arkClient.ArkV1(),
+		s.veleroInformerFactory.Velero().V1().PodVolumeRestores(),
+		s.veleroClient.VeleroV1(),
 		s.podInformer,
 		s.secretInformer,
 		s.kubeInformerFactory.Core().V1().PersistentVolumeClaims(),
-		s.arkInformerFactory.Ark().V1().BackupStorageLocations(),
+		s.kubeInformerFactory.Core().V1().PersistentVolumes(),
+		s.veleroInformerFactory.Velero().V1().BackupStorageLocations(),
 		os.Getenv("NODE_NAME"),
 	)
 	wg.Add(1)
@@ -178,7 +191,7 @@ func (s *resticServer) run() {
 		restoreController.Run(s.ctx, 1)
 	}()
 
-	go s.arkInformerFactory.Start(s.ctx.Done())
+	go s.veleroInformerFactory.Start(s.ctx.Done())
 	go s.kubeInformerFactory.Start(s.ctx.Done())
 	go s.podInformer.Run(s.ctx.Done())
 	go s.secretInformer.Run(s.ctx.Done())
@@ -189,4 +202,51 @@ func (s *resticServer) run() {
 
 	s.logger.Info("Waiting for all controllers to shut down gracefully")
 	wg.Wait()
+}
+
+// validatePodVolumesHostPath validates that the pod volumes path contains a
+// directory for each Pod running on this node
+func (s *resticServer) validatePodVolumesHostPath() error {
+	files, err := s.fileSystem.ReadDir("/host_pods/")
+	if err != nil {
+		return errors.Wrap(err, "could not read pod volumes host path")
+	}
+
+	// create a map of directory names inside the pod volumes path
+	dirs := sets.NewString()
+	for _, f := range files {
+		if f.IsDir() {
+			dirs.Insert(f.Name())
+		}
+	}
+
+	pods, err := s.kubeClient.CoreV1().Pods("").List(metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s,status.phase=Running", os.Getenv("NODE_NAME"))})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	valid := true
+	for _, pod := range pods.Items {
+		dirName := string(pod.GetUID())
+
+		// if the pod is a mirror pod, the directory name is the hash value of the
+		// mirror pod annotation
+		if hash, ok := pod.GetAnnotations()[v1.MirrorPodAnnotationKey]; ok {
+			dirName = hash
+		}
+
+		if !dirs.Has(dirName) {
+			valid = false
+			s.logger.WithFields(logrus.Fields{
+				"pod":  fmt.Sprintf("%s/%s", pod.GetNamespace(), pod.GetName()),
+				"path": "/host_pods/" + dirName,
+			}).Debug("could not find volumes for pod in host path")
+		}
+	}
+
+	if !valid {
+		return errors.New("unexpected directory structure for host-pods volume, ensure that the host-pods volume corresponds to the pods subdirectory of the kubelet root directory")
+	}
+
+	return nil
 }

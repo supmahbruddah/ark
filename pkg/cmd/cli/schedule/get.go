@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,10 @@ import (
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd"
-	"github.com/heptio/ark/pkg/cmd/util/output"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/output"
 )
 
 func NewGetCommand(f client.Factory, use string) *cobra.Command {
@@ -36,19 +36,19 @@ func NewGetCommand(f client.Factory, use string) *cobra.Command {
 			err := output.ValidateFlags(c)
 			cmd.CheckError(err)
 
-			arkClient, err := f.Client()
+			veleroClient, err := f.Client()
 			cmd.CheckError(err)
 
 			var schedules *api.ScheduleList
 			if len(args) > 0 {
 				schedules = new(api.ScheduleList)
 				for _, name := range args {
-					schedule, err := arkClient.Ark().Schedules(f.Namespace()).Get(name, metav1.GetOptions{})
+					schedule, err := veleroClient.VeleroV1().Schedules(f.Namespace()).Get(name, metav1.GetOptions{})
 					cmd.CheckError(err)
 					schedules.Items = append(schedules.Items, *schedule)
 				}
 			} else {
-				schedules, err = arkClient.ArkV1().Schedules(f.Namespace()).List(listOptions)
+				schedules, err = veleroClient.VeleroV1().Schedules(f.Namespace()).List(listOptions)
 				cmd.CheckError(err)
 			}
 

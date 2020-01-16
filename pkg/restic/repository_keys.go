@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	CredentialsSecretName = "ark-restic-credentials"
+	CredentialsSecretName = "velero-restic-credentials"
 	CredentialsKey        = "repository-password"
 
 	encryptionKey = "static-passw0rd"

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@ import (
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd"
-	"github.com/heptio/ark/pkg/cmd/cli/backup"
-	"github.com/heptio/ark/pkg/cmd/util/output"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/backup"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/output"
 )
 
 func NewCreateCommand(f client.Factory, use string) *cobra.Command {
@@ -37,7 +37,7 @@ func NewCreateCommand(f client.Factory, use string) *cobra.Command {
 	c := &cobra.Command{
 		Use:   use + " NAME --schedule",
 		Short: "Create a schedule",
-		Long: `The --schedule flag is required, in cron notation:
+		Long: `The --schedule flag is required, in cron notation, using UTC time:
 
 | Character Position | Character Period | Acceptable Values |
 | -------------------|:----------------:| -----------------:|
@@ -45,10 +45,25 @@ func NewCreateCommand(f client.Factory, use string) *cobra.Command {
 | 2                  | Hour             | 0-23,*            |
 | 3                  | Day of Month     | 1-31,*            |
 | 4                  | Month            | 1-12,*            |
-| 5                  | Day of Week      | 0-7,*             |`,
+| 5                  | Day of Week      | 0-7,*             |
 
-		Example: `ark create schedule NAME --schedule="0 */6 * * *"`,
-		Args:    cobra.ExactArgs(1),
+The schedule can also be expressed using "@every <duration>" syntax. The duration
+can be specified using a combination of seconds (s), minutes (m), and hours (h), for
+example: "@every 2h30m".`,
+
+		Example: `	# Create a backup every 6 hours
+	velero create schedule NAME --schedule="0 */6 * * *"
+
+	# Create a backup every 6 hours with the @every notation
+	velero create schedule NAME --schedule="@every 6h"
+
+	# Create a daily backup of the web namespace
+	velero create schedule NAME --schedule="@every 24h" --include-namespaces web
+
+	# Create a weekly backup, each living for 90 days (2160 hours)
+	velero create schedule NAME --schedule="@every 168h" --ttl 2160h0m0s
+	`,
+		Args: cobra.ExactArgs(1),
 		Run: func(c *cobra.Command, args []string) {
 			cmd.CheckError(o.Complete(args, f))
 			cmd.CheckError(o.Validate(c, args, f))
@@ -94,7 +109,7 @@ func (o *CreateOptions) Complete(args []string, f client.Factory) error {
 }
 
 func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
-	arkClient, err := f.Client()
+	veleroClient, err := f.Client()
 	if err != nil {
 		return err
 	}
@@ -126,7 +141,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		return err
 	}
 
-	_, err = arkClient.ArkV1().Schedules(schedule.Namespace).Create(schedule)
+	_, err = veleroClient.VeleroV1().Schedules(schedule.Namespace).Create(schedule)
 	if err != nil {
 		return err
 	}

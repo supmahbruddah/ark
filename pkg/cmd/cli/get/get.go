@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,19 +19,20 @@ package get
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/cmd/cli/backup"
-	"github.com/heptio/ark/pkg/cmd/cli/backuplocation"
-	"github.com/heptio/ark/pkg/cmd/cli/restore"
-	"github.com/heptio/ark/pkg/cmd/cli/schedule"
-	"github.com/heptio/ark/pkg/cmd/cli/snapshotlocation"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/backup"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/backuplocation"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/plugin"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/restore"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/schedule"
+	"github.com/vmware-tanzu/velero/pkg/cmd/cli/snapshotlocation"
 )
 
 func NewCommand(f client.Factory) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "get",
-		Short: "Get ark resources",
-		Long:  "Get ark resources",
+		Short: "Get velero resources",
+		Long:  "Get velero resources",
 	}
 
 	backupCommand := backup.NewGetCommand(f, "backups")
@@ -49,12 +50,16 @@ func NewCommand(f client.Factory) *cobra.Command {
 	snapshotLocationCommand := snapshotlocation.NewGetCommand(f, "snapshot-locations")
 	snapshotLocationCommand.Aliases = []string{"snapshot-location"}
 
+	pluginCommand := plugin.NewGetCommand(f, "plugins")
+	pluginCommand.Aliases = []string{"plugin"}
+
 	c.AddCommand(
 		backupCommand,
 		scheduleCommand,
 		restoreCommand,
 		backupLocationCommand,
 		snapshotLocationCommand,
+		pluginCommand,
 	)
 
 	return c

@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,19 +17,28 @@ limitations under the License.
 package install
 
 import (
+	"fmt"
 	"strings"
+	"time"
 
-	appsv1beta1 "k8s.io/api/apps/v1beta1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/vmware-tanzu/velero/pkg/builder"
 )
 
 type podTemplateOption func(*podTemplateConfig)
 
 type podTemplateConfig struct {
-	image                    string
-	withoutCredentialsVolume bool
-	envVars                  []corev1.EnvVar
+	image                             string
+	envVars                           []corev1.EnvVar
+	restoreOnly                       bool
+	annotations                       map[string]string
+	resources                         corev1.ResourceRequirements
+	withSecret                        bool
+	defaultResticMaintenanceFrequency time.Duration
+	plugins                           []string
 }
 
 func WithImage(image string) podTemplateOption {
@@ -38,9 +47,9 @@ func WithImage(image string) podTemplateOption {
 	}
 }
 
-func WithoutCredentialsVolume() podTemplateOption {
+func WithAnnotations(annotations map[string]string) podTemplateOption {
 	return func(c *podTemplateConfig) {
-		c.withoutCredentialsVolume = true
+		c.annotations = annotations
 	}
 }
 
@@ -60,9 +69,41 @@ func WithEnvFromSecretKey(varName, secret, key string) podTemplateOption {
 	}
 }
 
-func Deployment(namespace string, opts ...podTemplateOption) *appsv1beta1.Deployment {
+func WithSecret(secretPresent bool) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.withSecret = secretPresent
+
+	}
+}
+
+func WithRestoreOnly() podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.restoreOnly = true
+	}
+}
+
+func WithResources(resources corev1.ResourceRequirements) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.resources = resources
+	}
+}
+
+func WithDefaultResticMaintenanceFrequency(val time.Duration) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.defaultResticMaintenanceFrequency = val
+	}
+}
+
+func WithPlugins(plugins []string) podTemplateOption {
+	return func(c *podTemplateConfig) {
+		c.plugins = plugins
+	}
+}
+
+func Deployment(namespace string, opts ...podTemplateOption) *appsv1.Deployment {
+	// TODO: Add support for server args
 	c := &podTemplateConfig{
-		image: "gcr.io/heptio-images/ark:latest",
+		image: DefaultImage,
 	}
 
 	for _, opt := range opts {
@@ -76,25 +117,33 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1beta1.Deploy
 
 	}
 
-	deployment := &appsv1beta1.Deployment{
-		ObjectMeta: objectMeta(namespace, "ark"),
-		Spec: appsv1beta1.DeploymentSpec{
+	containerLabels := labels()
+	containerLabels["deploy"] = "velero"
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: objectMeta(namespace, "velero"),
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Deployment",
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"deploy": "velero"}},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels:      labels(),
-					Annotations: podAnnotations(),
+					Labels:      containerLabels,
+					Annotations: podAnnotations(c.annotations),
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyAlways,
-					ServiceAccountName: "ark",
+					ServiceAccountName: "velero",
 					Containers: []corev1.Container{
 						{
-							Name:            "ark",
+							Name:            "velero",
 							Image:           c.image,
 							Ports:           containerPorts(),
 							ImagePullPolicy: pullPolicy,
 							Command: []string{
-								"/ark",
+								"/velero",
 							},
 							Args: []string{
 								"server",
@@ -104,17 +153,30 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1beta1.Deploy
 									Name:      "plugins",
 									MountPath: "/plugins",
 								},
+								{
+									Name:      "scratch",
+									MountPath: "/scratch",
+								},
 							},
 							Env: []corev1.EnvVar{
 								{
-									Name:  "GOOGLE_APPLICATION_CREDENTIALS",
-									Value: "/credentials/cloud",
+									Name:  "VELERO_SCRATCH_DIR",
+									Value: "/scratch",
 								},
 								{
-									Name:  "AWS_SHARED_CREDENTIALS_FILE",
-									Value: "/credentials/cloud",
+									Name: "VELERO_NAMESPACE",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "metadata.namespace",
+										},
+									},
+								},
+								{
+									Name:  "LD_LIBRARY_PATH",
+									Value: "/plugins",
 								},
 							},
+							Resources: c.resources,
 						},
 					},
 					Volumes: []corev1.Volume{
@@ -124,13 +186,19 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1beta1.Deploy
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
+						{
+							Name: "scratch",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: new(corev1.EmptyDirVolumeSource),
+							},
+						},
 					},
 				},
 			},
 		},
 	}
 
-	if !c.withoutCredentialsVolume {
+	if c.withSecret {
 		deployment.Spec.Template.Spec.Volumes = append(
 			deployment.Spec.Template.Spec.Volumes,
 			corev1.Volume{
@@ -150,6 +218,43 @@ func Deployment(namespace string, opts ...podTemplateOption) *appsv1beta1.Deploy
 				MountPath: "/credentials",
 			},
 		)
+
+		deployment.Spec.Template.Spec.Containers[0].Env = append(deployment.Spec.Template.Spec.Containers[0].Env, []corev1.EnvVar{
+			{
+				Name:  "GOOGLE_APPLICATION_CREDENTIALS",
+				Value: "/credentials/cloud",
+			},
+			{
+				Name:  "AWS_SHARED_CREDENTIALS_FILE",
+				Value: "/credentials/cloud",
+			},
+			{
+				Name:  "AZURE_CREDENTIALS_FILE",
+				Value: "/credentials/cloud",
+			},
+			{
+				Name:  "ALIBABA_CLOUD_CREDENTIALS_FILE",
+				Value: "/credentials/cloud",
+			},
+		}...)
+	}
+
+	deployment.Spec.Template.Spec.Containers[0].Env = append(deployment.Spec.Template.Spec.Containers[0].Env, c.envVars...)
+
+	if c.restoreOnly {
+		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, "--restore-only")
+	}
+
+	if c.defaultResticMaintenanceFrequency > 0 {
+		deployment.Spec.Template.Spec.Containers[0].Args = append(deployment.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("--default-restic-prune-frequency=%v", c.defaultResticMaintenanceFrequency))
+	}
+
+	if len(c.plugins) > 0 {
+		for _, image := range c.plugins {
+			container := *builder.ForPluginContainer(image, pullPolicy).Result()
+			deployment.Spec.Template.Spec.InitContainers = append(deployment.Spec.Template.Spec.InitContainers, container)
+		}
+
 	}
 
 	return deployment

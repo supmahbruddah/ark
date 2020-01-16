@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,15 +27,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/clock"
 
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions"
-	"github.com/heptio/ark/pkg/persistence"
-	persistencemocks "github.com/heptio/ark/pkg/persistence/mocks"
-	"github.com/heptio/ark/pkg/plugin"
-	pluginmocks "github.com/heptio/ark/pkg/plugin/mocks"
-	kubeutil "github.com/heptio/ark/pkg/util/kube"
-	arktest "github.com/heptio/ark/pkg/util/test"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/fake"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions"
+	"github.com/vmware-tanzu/velero/pkg/persistence"
+	persistencemocks "github.com/vmware-tanzu/velero/pkg/persistence/mocks"
+	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	pluginmocks "github.com/vmware-tanzu/velero/pkg/plugin/mocks"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
+	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 type downloadRequestTestHarness struct {
@@ -54,13 +55,13 @@ func newDownloadRequestTestHarness(t *testing.T) *downloadRequestTestHarness {
 		pluginManager   = new(pluginmocks.Manager)
 		backupStore     = new(persistencemocks.BackupStore)
 		controller      = NewDownloadRequestController(
-			client.ArkV1(),
-			informerFactory.Ark().V1().DownloadRequests(),
-			informerFactory.Ark().V1().Restores(),
-			informerFactory.Ark().V1().BackupStorageLocations(),
-			informerFactory.Ark().V1().Backups(),
-			func(logrus.FieldLogger) plugin.Manager { return pluginManager },
-			arktest.NewLogger(),
+			client.VeleroV1(),
+			informerFactory.Velero().V1().DownloadRequests(),
+			informerFactory.Velero().V1().Restores(),
+			informerFactory.Velero().V1().BackupStorageLocations(),
+			informerFactory.Velero().V1().Backups(),
+			func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
+			velerotest.NewLogger(),
 		).(*downloadRequestController)
 	)
 
@@ -119,6 +120,10 @@ func newBackupLocation(name, provider, bucket string) *v1.BackupStorageLocation 
 }
 
 func TestProcessDownloadRequest(t *testing.T) {
+	defaultBackup := func() *v1.Backup {
+		return builder.ForBackup(v1.DefaultNamespace, "a-backup").StorageLocation("a-location").Result()
+	}
+
 	tests := []struct {
 		name            string
 		key             string
@@ -145,94 +150,94 @@ func TestProcessDownloadRequest(t *testing.T) {
 		{
 			name:            "backup contents request for nonexistent backup returns an error",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindBackupContents, "a-backup"),
-			backup:          arktest.NewTestBackup().WithName("non-matching-backup").WithStorageLocation("a-location").Backup,
+			backup:          builder.ForBackup(v1.DefaultNamespace, "non-matching-backup").StorageLocation("a-location").Result(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
-			expectedErr:     "backup.ark.heptio.com \"a-backup\" not found",
+			expectedErr:     "backup.velero.io \"a-backup\" not found",
 		},
 		{
 			name:            "restore log request for nonexistent restore returns an error",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindRestoreLog, "a-backup-20170912150214"),
-			restore:         arktest.NewTestRestore(v1.DefaultNamespace, "non-matching-restore", v1.RestorePhaseCompleted).WithBackup("a-backup").Restore,
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			restore:         builder.ForRestore(v1.DefaultNamespace, "non-matching-restore").Phase(v1.RestorePhaseCompleted).Backup("a-backup").Result(),
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
-			expectedErr:     "error getting Restore: restore.ark.heptio.com \"a-backup-20170912150214\" not found",
+			expectedErr:     "error getting Restore: restore.velero.io \"a-backup-20170912150214\" not found",
 		},
 		{
 			name:            "backup contents request for backup with nonexistent location returns an error",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindBackupContents, "a-backup"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("non-matching-location", "a-provider", "a-bucket"),
-			expectedErr:     "backupstoragelocation.ark.heptio.com \"a-location\" not found",
+			expectedErr:     "backupstoragelocation.velero.io \"a-location\" not found",
 		},
 		{
 			name:            "backup contents request with phase '' gets a url",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindBackupContents, "a-backup"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "backup contents request with phase 'New' gets a url",
 			downloadRequest: newDownloadRequest(v1.DownloadRequestPhaseNew, v1.DownloadTargetKindBackupContents, "a-backup"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "backup log request with phase '' gets a url",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindBackupLog, "a-backup"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "backup log request with phase 'New' gets a url",
 			downloadRequest: newDownloadRequest(v1.DownloadRequestPhaseNew, v1.DownloadTargetKindBackupLog, "a-backup"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "restore log request with phase '' gets a url",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindRestoreLog, "a-backup-20170912150214"),
-			restore:         arktest.NewTestRestore(v1.DefaultNamespace, "a-backup-20170912150214", v1.RestorePhaseCompleted).WithBackup("a-backup").Restore,
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			restore:         builder.ForRestore(v1.DefaultNamespace, "a-backup-20170912150214").Phase(v1.RestorePhaseCompleted).Backup("a-backup").Result(),
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "restore log request with phase 'New' gets a url",
 			downloadRequest: newDownloadRequest(v1.DownloadRequestPhaseNew, v1.DownloadTargetKindRestoreLog, "a-backup-20170912150214"),
-			restore:         arktest.NewTestRestore(v1.DefaultNamespace, "a-backup-20170912150214", v1.RestorePhaseCompleted).WithBackup("a-backup").Restore,
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			restore:         builder.ForRestore(v1.DefaultNamespace, "a-backup-20170912150214").Phase(v1.RestorePhaseCompleted).Backup("a-backup").Result(),
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "restore results request with phase '' gets a url",
 			downloadRequest: newDownloadRequest("", v1.DownloadTargetKindRestoreResults, "a-backup-20170912150214"),
-			restore:         arktest.NewTestRestore(v1.DefaultNamespace, "a-backup-20170912150214", v1.RestorePhaseCompleted).WithBackup("a-backup").Restore,
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			restore:         builder.ForRestore(v1.DefaultNamespace, "a-backup-20170912150214").Phase(v1.RestorePhaseCompleted).Backup("a-backup").Result(),
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "restore results request with phase 'New' gets a url",
 			downloadRequest: newDownloadRequest(v1.DownloadRequestPhaseNew, v1.DownloadTargetKindRestoreResults, "a-backup-20170912150214"),
-			restore:         arktest.NewTestRestore(v1.DefaultNamespace, "a-backup-20170912150214", v1.RestorePhaseCompleted).WithBackup("a-backup").Restore,
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			restore:         builder.ForRestore(v1.DefaultNamespace, "a-backup-20170912150214").Phase(v1.RestorePhaseCompleted).Backup("a-backup").Result(),
+			backup:          defaultBackup(),
 			backupLocation:  newBackupLocation("a-location", "a-provider", "a-bucket"),
 			expectGetsURL:   true,
 		},
 		{
 			name:            "request with phase 'Processed' is not deleted if not expired",
 			downloadRequest: newDownloadRequest(v1.DownloadRequestPhaseProcessed, v1.DownloadTargetKindBackupLog, "a-backup-20170912150214"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 		},
 		{
 			name:            "request with phase 'Processed' is deleted if expired",
 			downloadRequest: newDownloadRequest(v1.DownloadRequestPhaseProcessed, v1.DownloadTargetKindBackupLog, "a-backup-20170912150214"),
-			backup:          arktest.NewTestBackup().WithName("a-backup").WithStorageLocation("a-location").Backup,
+			backup:          defaultBackup(),
 			expired:         true,
 		},
 	}
@@ -247,29 +252,29 @@ func TestProcessDownloadRequest(t *testing.T) {
 			// clock time, it's easier to do this here than as part of the test case definitions.
 			if tc.downloadRequest != nil && tc.downloadRequest.Status.Phase == v1.DownloadRequestPhaseProcessed {
 				if tc.expired {
-					tc.downloadRequest.Status.Expiration.Time = harness.controller.clock.Now().Add(-1 * time.Minute)
+					tc.downloadRequest.Status.Expiration = &metav1.Time{Time: harness.controller.clock.Now().Add(-1 * time.Minute)}
 				} else {
-					tc.downloadRequest.Status.Expiration.Time = harness.controller.clock.Now().Add(time.Minute)
+					tc.downloadRequest.Status.Expiration = &metav1.Time{Time: harness.controller.clock.Now().Add(time.Minute)}
 				}
 			}
 
 			if tc.downloadRequest != nil {
-				require.NoError(t, harness.informerFactory.Ark().V1().DownloadRequests().Informer().GetStore().Add(tc.downloadRequest))
+				require.NoError(t, harness.informerFactory.Velero().V1().DownloadRequests().Informer().GetStore().Add(tc.downloadRequest))
 
-				_, err := harness.client.ArkV1().DownloadRequests(tc.downloadRequest.Namespace).Create(tc.downloadRequest)
+				_, err := harness.client.VeleroV1().DownloadRequests(tc.downloadRequest.Namespace).Create(tc.downloadRequest)
 				require.NoError(t, err)
 			}
 
 			if tc.restore != nil {
-				require.NoError(t, harness.informerFactory.Ark().V1().Restores().Informer().GetStore().Add(tc.restore))
+				require.NoError(t, harness.informerFactory.Velero().V1().Restores().Informer().GetStore().Add(tc.restore))
 			}
 
 			if tc.backup != nil {
-				require.NoError(t, harness.informerFactory.Ark().V1().Backups().Informer().GetStore().Add(tc.backup))
+				require.NoError(t, harness.informerFactory.Velero().V1().Backups().Informer().GetStore().Add(tc.backup))
 			}
 
 			if tc.backupLocation != nil {
-				require.NoError(t, harness.informerFactory.Ark().V1().BackupStorageLocations().Informer().GetStore().Add(tc.backupLocation))
+				require.NoError(t, harness.informerFactory.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(tc.backupLocation))
 			}
 
 			if tc.expectGetsURL {
@@ -292,16 +297,16 @@ func TestProcessDownloadRequest(t *testing.T) {
 			}
 
 			if tc.expectGetsURL {
-				output, err := harness.client.ArkV1().DownloadRequests(tc.downloadRequest.Namespace).Get(tc.downloadRequest.Name, metav1.GetOptions{})
+				output, err := harness.client.VeleroV1().DownloadRequests(tc.downloadRequest.Namespace).Get(tc.downloadRequest.Name, metav1.GetOptions{})
 				require.NoError(t, err)
 
 				assert.Equal(t, string(v1.DownloadRequestPhaseProcessed), string(output.Status.Phase))
 				assert.Equal(t, "a-url", output.Status.DownloadURL)
-				assert.True(t, arktest.TimesAreEqual(harness.controller.clock.Now().Add(signedURLTTL), output.Status.Expiration.Time), "expiration does not match")
+				assert.True(t, velerotest.TimesAreEqual(harness.controller.clock.Now().Add(signedURLTTL), output.Status.Expiration.Time), "expiration does not match")
 			}
 
 			if tc.downloadRequest != nil && tc.downloadRequest.Status.Phase == v1.DownloadRequestPhaseProcessed {
-				res, err := harness.client.ArkV1().DownloadRequests(tc.downloadRequest.Namespace).Get(tc.downloadRequest.Name, metav1.GetOptions{})
+				res, err := harness.client.VeleroV1().DownloadRequests(tc.downloadRequest.Namespace).Get(tc.downloadRequest.Name, metav1.GetOptions{})
 
 				if tc.expired {
 					assert.True(t, apierrors.IsNotFound(err))

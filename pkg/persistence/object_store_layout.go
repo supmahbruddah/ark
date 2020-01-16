@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"strings"
 )
 
-// ObjectStoreLayout defines how Ark's persisted files map to
+// ObjectStoreLayout defines how Velero's persisted files map to
 // keys in an object storage bucket.
 type ObjectStoreLayout struct {
 	rootPrefix string
@@ -59,10 +59,6 @@ func (l *ObjectStoreLayout) isValidSubdir(name string) bool {
 	return ok
 }
 
-func (l *ObjectStoreLayout) getRevisionKey() string {
-	return path.Join(l.subdirs["metadata"], "revision")
-}
-
 func (l *ObjectStoreLayout) getBackupDir(backup string) string {
 	return path.Join(l.subdirs["backups"], backup) + "/"
 }
@@ -72,7 +68,7 @@ func (l *ObjectStoreLayout) getRestoreDir(restore string) string {
 }
 
 func (l *ObjectStoreLayout) getBackupMetadataKey(backup string) string {
-	return path.Join(l.subdirs["backups"], backup, "ark-backup.json")
+	return path.Join(l.subdirs["backups"], backup, "velero-backup.json")
 }
 
 func (l *ObjectStoreLayout) getBackupContentsKey(backup string) string {
@@ -83,8 +79,16 @@ func (l *ObjectStoreLayout) getBackupLogKey(backup string) string {
 	return path.Join(l.subdirs["backups"], backup, fmt.Sprintf("%s-logs.gz", backup))
 }
 
+func (l *ObjectStoreLayout) getPodVolumeBackupsKey(backup string) string {
+	return path.Join(l.subdirs["backups"], backup, fmt.Sprintf("%s-podvolumebackups.json.gz", backup))
+}
+
 func (l *ObjectStoreLayout) getBackupVolumeSnapshotsKey(backup string) string {
 	return path.Join(l.subdirs["backups"], backup, fmt.Sprintf("%s-volumesnapshots.json.gz", backup))
+}
+
+func (l *ObjectStoreLayout) getBackupResourceListKey(backup string) string {
+	return path.Join(l.subdirs["backups"], backup, fmt.Sprintf("%s-resource-list.json.gz", backup))
 }
 
 func (l *ObjectStoreLayout) getRestoreLogKey(restore string) string {

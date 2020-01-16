@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,23 +25,25 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
 	core "k8s.io/client-go/testing"
 
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	pkgbackup "github.com/heptio/ark/pkg/backup"
-	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions"
-	"github.com/heptio/ark/pkg/persistence"
-	persistencemocks "github.com/heptio/ark/pkg/persistence/mocks"
-	"github.com/heptio/ark/pkg/plugin"
-	pluginmocks "github.com/heptio/ark/pkg/plugin/mocks"
-	arktest "github.com/heptio/ark/pkg/util/test"
-	"github.com/heptio/ark/pkg/volume"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
+	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/fake"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions"
+	"github.com/vmware-tanzu/velero/pkg/metrics"
+	"github.com/vmware-tanzu/velero/pkg/persistence"
+	persistencemocks "github.com/vmware-tanzu/velero/pkg/persistence/mocks"
+	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	pluginmocks "github.com/vmware-tanzu/velero/pkg/plugin/mocks"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
+	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
 func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
@@ -49,18 +51,19 @@ func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
 	sharedInformers := informers.NewSharedInformerFactory(client, 0)
 
 	controller := NewBackupDeletionController(
-		arktest.NewLogger(),
-		sharedInformers.Ark().V1().DeleteBackupRequests(),
-		client.ArkV1(), // deleteBackupRequestClient
-		client.ArkV1(), // backupClient
-		sharedInformers.Ark().V1().Restores(),
-		client.ArkV1(), // restoreClient
+		velerotest.NewLogger(),
+		sharedInformers.Velero().V1().DeleteBackupRequests(),
+		client.VeleroV1(), // deleteBackupRequestClient
+		client.VeleroV1(), // backupClient
+		sharedInformers.Velero().V1().Restores(),
+		client.VeleroV1(), // restoreClient
 		NewBackupTracker(),
 		nil, // restic repository manager
-		sharedInformers.Ark().V1().PodVolumeBackups(),
-		sharedInformers.Ark().V1().BackupStorageLocations(),
-		sharedInformers.Ark().V1().VolumeSnapshotLocations(),
+		sharedInformers.Velero().V1().PodVolumeBackups(),
+		sharedInformers.Velero().V1().BackupStorageLocations(),
+		sharedInformers.Velero().V1().VolumeSnapshotLocations(),
 		nil, // new plugin manager func
+		metrics.NewServerMetrics(),
 	).(*backupDeletionController)
 
 	// Error splitting key
@@ -84,7 +87,7 @@ func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
 	for _, phase := range []v1.DeleteBackupRequestPhase{"", v1.DeleteBackupRequestPhaseNew, v1.DeleteBackupRequestPhaseInProgress} {
 		t.Run(fmt.Sprintf("phase=%s", phase), func(t *testing.T) {
 			req.Status.Phase = phase
-			sharedInformers.Ark().V1().DeleteBackupRequests().Informer().GetStore().Add(req)
+			sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(req)
 
 			var errorToReturn error
 			var actual *v1.DeleteBackupRequest
@@ -111,42 +114,46 @@ func TestBackupDeletionControllerProcessQueueItem(t *testing.T) {
 }
 
 type backupDeletionControllerTestData struct {
-	client          *fake.Clientset
-	sharedInformers informers.SharedInformerFactory
-	blockStore      *arktest.FakeBlockStore
-	backupStore     *persistencemocks.BackupStore
-	controller      *backupDeletionController
-	req             *v1.DeleteBackupRequest
+	client            *fake.Clientset
+	sharedInformers   informers.SharedInformerFactory
+	volumeSnapshotter *velerotest.FakeVolumeSnapshotter
+	backupStore       *persistencemocks.BackupStore
+	controller        *backupDeletionController
+	req               *v1.DeleteBackupRequest
 }
 
 func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletionControllerTestData {
+	req := pkgbackup.NewDeleteBackupRequest("foo", "uid")
+	req.Namespace = "velero"
+	req.Name = "foo-abcde"
+
 	var (
-		client          = fake.NewSimpleClientset(objects...)
-		sharedInformers = informers.NewSharedInformerFactory(client, 0)
-		blockStore      = &arktest.FakeBlockStore{SnapshotsTaken: sets.NewString()}
-		pluginManager   = &pluginmocks.Manager{}
-		backupStore     = &persistencemocks.BackupStore{}
-		req             = pkgbackup.NewDeleteBackupRequest("foo", "uid")
+		client            = fake.NewSimpleClientset(append(objects, req)...)
+		sharedInformers   = informers.NewSharedInformerFactory(client, 0)
+		volumeSnapshotter = &velerotest.FakeVolumeSnapshotter{SnapshotsTaken: sets.NewString()}
+		pluginManager     = &pluginmocks.Manager{}
+		backupStore       = &persistencemocks.BackupStore{}
 	)
 
 	data := &backupDeletionControllerTestData{
-		client:          client,
-		sharedInformers: sharedInformers,
-		blockStore:      blockStore,
-		backupStore:     backupStore,
+		client:            client,
+		sharedInformers:   sharedInformers,
+		volumeSnapshotter: volumeSnapshotter,
+		backupStore:       backupStore,
 		controller: NewBackupDeletionController(
-			arktest.NewLogger(),
-			sharedInformers.Ark().V1().DeleteBackupRequests(),
-			client.ArkV1(), // deleteBackupRequestClient
-			client.ArkV1(), // backupClient
-			sharedInformers.Ark().V1().Restores(),
-			client.ArkV1(), // restoreClient
+			velerotest.NewLogger(),
+			sharedInformers.Velero().V1().DeleteBackupRequests(),
+			client.VeleroV1(), // deleteBackupRequestClient
+			client.VeleroV1(), // backupClient
+			sharedInformers.Velero().V1().Restores(),
+			client.VeleroV1(), // restoreClient
 			NewBackupTracker(),
 			nil, // restic repository manager
-			sharedInformers.Ark().V1().PodVolumeBackups(),
-			sharedInformers.Ark().V1().BackupStorageLocations(),
-			sharedInformers.Ark().V1().VolumeSnapshotLocations(),
-			func(logrus.FieldLogger) plugin.Manager { return pluginManager },
+			sharedInformers.Velero().V1().PodVolumeBackups(),
+			sharedInformers.Velero().V1().BackupStorageLocations(),
+			sharedInformers.Velero().V1().VolumeSnapshotLocations(),
+			func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
+			metrics.NewServerMetrics(),
 		).(*backupDeletionController),
 
 		req: req,
@@ -157,9 +164,6 @@ func setupBackupDeletionControllerTest(objects ...runtime.Object) *backupDeletio
 	}
 
 	pluginManager.On("CleanupClients").Return(nil)
-
-	req.Namespace = "heptio-ark"
-	req.Name = "foo-abcde"
 
 	return data
 }
@@ -178,6 +182,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
+				types.MergePatchType,
 				[]byte(`{"status":{"errors":["spec.backupName is required"],"phase":"Processed"}}`),
 			),
 		}
@@ -192,7 +197,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		// past checking for an in-progress backup. this makes validation easier.
 		td.controller.backupTracker.Add(td.req.Namespace, td.req.Spec.BackupName)
 
-		require.NoError(t, td.sharedInformers.Ark().V1().DeleteBackupRequests().Informer().GetStore().Add(td.req))
+		require.NoError(t, td.sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(td.req))
 
 		existing := &v1.DeleteBackupRequest{
 			ObjectMeta: metav1.ObjectMeta{
@@ -206,11 +211,11 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				BackupName: td.req.Spec.BackupName,
 			},
 		}
-		require.NoError(t, td.sharedInformers.Ark().V1().DeleteBackupRequests().Informer().GetStore().Add(existing))
-		_, err := td.client.ArkV1().DeleteBackupRequests(td.req.Namespace).Create(existing)
+		require.NoError(t, td.sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(existing))
+		_, err := td.client.VeleroV1().DeleteBackupRequests(td.req.Namespace).Create(existing)
 		require.NoError(t, err)
 
-		require.NoError(t, td.sharedInformers.Ark().V1().DeleteBackupRequests().Informer().GetStore().Add(
+		require.NoError(t, td.sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(
 			&v1.DeleteBackupRequest{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: td.req.Namespace,
@@ -253,6 +258,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
+				types.MergePatchType,
 				[]byte(`{"status":{"errors":["backup is still in progress"],"phase":"Processed"}}`),
 			),
 		}
@@ -261,7 +267,12 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 	})
 
 	t.Run("patching to InProgress fails", func(t *testing.T) {
-		td := setupBackupDeletionControllerTest()
+		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
+		location := builder.ForBackupStorageLocation("velero", "default").Result()
+
+		td := setupBackupDeletionControllerTest(backup)
+
+		td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location)
 
 		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("bad")
@@ -269,11 +280,31 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		err := td.controller.processRequest(td.req)
 		assert.EqualError(t, err, "error patching DeleteBackupRequest: bad")
+
+		expectedActions := []core.Action{
+			core.NewGetAction(
+				v1.SchemeGroupVersion.WithResource("backups"),
+				backup.Namespace,
+				backup.Name,
+			),
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				td.req.Namespace,
+				td.req.Name,
+				types.MergePatchType,
+				[]byte(`{"status":{"phase":"InProgress"}}`),
+			),
+		}
+		assert.Equal(t, expectedActions, td.client.Actions())
 	})
 
 	t.Run("patching backup to Deleting fails", func(t *testing.T) {
-		backup := arktest.NewTestBackup().WithName("foo").WithSnapshot("pv-1", "snap-1").Backup
+		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
+		location := builder.ForBackupStorageLocation("velero", "default").Result()
+
 		td := setupBackupDeletionControllerTest(backup)
+
+		td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location)
 
 		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
 			return true, td.req, nil
@@ -284,29 +315,38 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 
 		err := td.controller.processRequest(td.req)
 		assert.EqualError(t, err, "error patching Backup: bad")
+
+		expectedActions := []core.Action{
+			core.NewGetAction(
+				v1.SchemeGroupVersion.WithResource("backups"),
+				backup.Namespace,
+				backup.Name,
+			),
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				td.req.Namespace,
+				td.req.Name,
+				types.MergePatchType,
+				[]byte(`{"status":{"phase":"InProgress"}}`),
+			),
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("backups"),
+				backup.Namespace,
+				backup.Name,
+				types.MergePatchType,
+				[]byte(`{"status":{"phase":"Deleting"}}`),
+			),
+		}
+		assert.Equal(t, expectedActions, td.client.Actions())
 	})
 
 	t.Run("unable to find backup", func(t *testing.T) {
 		td := setupBackupDeletionControllerTest()
 
-		td.client.PrependReactor("get", "backups", func(action core.Action) (bool, runtime.Object, error) {
-			return true, nil, apierrors.NewNotFound(v1.SchemeGroupVersion.WithResource("backups").GroupResource(), "foo")
-		})
-
-		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
-			return true, td.req, nil
-		})
-
 		err := td.controller.processRequest(td.req)
 		require.NoError(t, err)
 
 		expectedActions := []core.Action{
-			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
-				td.req.Namespace,
-				td.req.Name,
-				[]byte(`{"status":{"phase":"InProgress"}}`),
-			),
 			core.NewGetAction(
 				v1.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
@@ -316,6 +356,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
+				types.MergePatchType,
 				[]byte(`{"status":{"errors":["backup not found"],"phase":"Processed"}}`),
 			),
 		}
@@ -323,88 +364,15 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		assert.Equal(t, expectedActions, td.client.Actions())
 	})
 
-	t.Run("pre-v0.10 backup with snapshots, no errors", func(t *testing.T) {
-		backup := arktest.NewTestBackup().WithName("foo").Backup
-		backup.UID = "uid"
-		backup.Spec.StorageLocation = "primary"
-		backup.Status.VolumeBackups = map[string]*v1.VolumeBackupInfo{
-			"pv-1": {
-				SnapshotID: "snap-1",
-			},
-		}
+	t.Run("unable to find backup storage location", func(t *testing.T) {
+		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
 
-		restore1 := arktest.NewTestRestore("heptio-ark", "restore-1", v1.RestorePhaseCompleted).WithBackup("foo").Restore
-		restore2 := arktest.NewTestRestore("heptio-ark", "restore-2", v1.RestorePhaseCompleted).WithBackup("foo").Restore
-		restore3 := arktest.NewTestRestore("heptio-ark", "restore-3", v1.RestorePhaseCompleted).WithBackup("some-other-backup").Restore
-
-		td := setupBackupDeletionControllerTest(backup, restore1, restore2, restore3)
-
-		td.sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore1)
-		td.sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore2)
-		td.sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore3)
-
-		location := &v1.BackupStorageLocation{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: backup.Namespace,
-				Name:      backup.Spec.StorageLocation,
-			},
-			Spec: v1.BackupStorageLocationSpec{
-				Provider: "objStoreProvider",
-				StorageType: v1.StorageType{
-					ObjectStorage: &v1.ObjectStorageLocation{
-						Bucket: "bucket",
-					},
-				},
-			},
-		}
-		require.NoError(t, td.sharedInformers.Ark().V1().BackupStorageLocations().Informer().GetStore().Add(location))
-
-		snapshotLocation := &v1.VolumeSnapshotLocation{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: backup.Namespace,
-				Name:      "vsl-1",
-			},
-			Spec: v1.VolumeSnapshotLocationSpec{
-				Provider: "provider-1",
-			},
-		}
-		require.NoError(t, td.sharedInformers.Ark().V1().VolumeSnapshotLocations().Informer().GetStore().Add(snapshotLocation))
-
-		// Clear out req labels to make sure the controller adds them
-		td.req.Labels = make(map[string]string)
-
-		td.client.PrependReactor("get", "backups", func(action core.Action) (bool, runtime.Object, error) {
-			return true, backup, nil
-		})
-		td.blockStore.SnapshotsTaken.Insert("snap-1")
-
-		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
-			return true, td.req, nil
-		})
-
-		td.client.PrependReactor("patch", "backups", func(action core.Action) (bool, runtime.Object, error) {
-			return true, backup, nil
-		})
-
-		pluginManager := &pluginmocks.Manager{}
-		pluginManager.On("GetBlockStore", "provider-1").Return(td.blockStore, nil)
-		pluginManager.On("CleanupClients")
-		td.controller.newPluginManager = func(logrus.FieldLogger) plugin.Manager { return pluginManager }
-
-		td.backupStore.On("DeleteBackup", td.req.Spec.BackupName).Return(nil)
-		td.backupStore.On("DeleteRestore", "restore-1").Return(nil)
-		td.backupStore.On("DeleteRestore", "restore-2").Return(nil)
+		td := setupBackupDeletionControllerTest(backup)
 
 		err := td.controller.processRequest(td.req)
 		require.NoError(t, err)
 
 		expectedActions := []core.Action{
-			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
-				td.req.Namespace,
-				td.req.Name,
-				[]byte(`{"metadata":{"labels":{"ark.heptio.com/backup-name":"foo"}},"status":{"phase":"InProgress"}}`),
-			),
 			core.NewGetAction(
 				v1.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
@@ -414,25 +382,27 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
-				[]byte(`{"metadata":{"labels":{"ark.heptio.com/backup-uid":"uid"}}}`),
+				types.MergePatchType,
+				[]byte(`{"status":{"errors":["backup storage location default not found"],"phase":"Processed"}}`),
 			),
-			core.NewPatchAction(
-				v1.SchemeGroupVersion.WithResource("backups"),
-				td.req.Namespace,
-				td.req.Spec.BackupName,
-				[]byte(`{"status":{"phase":"Deleting"}}`),
-			),
-			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("restores"),
-				td.req.Namespace,
-				"restore-1",
-			),
-			core.NewDeleteAction(
-				v1.SchemeGroupVersion.WithResource("restores"),
-				td.req.Namespace,
-				"restore-2",
-			),
-			core.NewDeleteAction(
+		}
+
+		assert.Equal(t, expectedActions, td.client.Actions())
+	})
+
+	t.Run("backup storage location is in read-only mode", func(t *testing.T) {
+		backup := builder.ForBackup(v1.DefaultNamespace, "foo").StorageLocation("default").Result()
+		location := builder.ForBackupStorageLocation("velero", "default").AccessMode(v1.BackupStorageLocationAccessModeReadOnly).Result()
+
+		td := setupBackupDeletionControllerTest(backup)
+
+		td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location)
+
+		err := td.controller.processRequest(td.req)
+		require.NoError(t, err)
+
+		expectedActions := []core.Action{
+			core.NewGetAction(
 				v1.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
@@ -441,35 +411,28 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
-				[]byte(`{"status":{"phase":"Processed"}}`),
-			),
-			core.NewDeleteCollectionAction(
-				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
-				td.req.Namespace,
-				pkgbackup.NewDeleteBackupRequestListOptions(td.req.Spec.BackupName, "uid"),
+				types.MergePatchType,
+				[]byte(`{"status":{"errors":["cannot delete backup because backup storage location default is currently in read-only mode"],"phase":"Processed"}}`),
 			),
 		}
 
-		arktest.CompareActions(t, expectedActions, td.client.Actions())
-
-		// Make sure snapshot was deleted
-		assert.Equal(t, 0, td.blockStore.SnapshotsTaken.Len())
+		assert.Equal(t, expectedActions, td.client.Actions())
 	})
 
 	t.Run("full delete, no errors", func(t *testing.T) {
-		backup := arktest.NewTestBackup().WithName("foo").Backup
+		backup := builder.ForBackup(v1.DefaultNamespace, "foo").Result()
 		backup.UID = "uid"
 		backup.Spec.StorageLocation = "primary"
 
-		restore1 := arktest.NewTestRestore("heptio-ark", "restore-1", v1.RestorePhaseCompleted).WithBackup("foo").Restore
-		restore2 := arktest.NewTestRestore("heptio-ark", "restore-2", v1.RestorePhaseCompleted).WithBackup("foo").Restore
-		restore3 := arktest.NewTestRestore("heptio-ark", "restore-3", v1.RestorePhaseCompleted).WithBackup("some-other-backup").Restore
+		restore1 := builder.ForRestore("velero", "restore-1").Phase(v1.RestorePhaseCompleted).Backup("foo").Result()
+		restore2 := builder.ForRestore("velero", "restore-2").Phase(v1.RestorePhaseCompleted).Backup("foo").Result()
+		restore3 := builder.ForRestore("velero", "restore-3").Phase(v1.RestorePhaseCompleted).Backup("some-other-backup").Result()
 
 		td := setupBackupDeletionControllerTest(backup, restore1, restore2, restore3)
 
-		td.sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore1)
-		td.sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore2)
-		td.sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore3)
+		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore1)
+		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore2)
+		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore3)
 
 		location := &v1.BackupStorageLocation{
 			ObjectMeta: metav1.ObjectMeta{
@@ -485,7 +448,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				},
 			},
 		}
-		require.NoError(t, td.sharedInformers.Ark().V1().BackupStorageLocations().Informer().GetStore().Add(location))
+		require.NoError(t, td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location))
 
 		snapshotLocation := &v1.VolumeSnapshotLocation{
 			ObjectMeta: metav1.ObjectMeta{
@@ -496,15 +459,17 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				Provider: "provider-1",
 			},
 		}
-		require.NoError(t, td.sharedInformers.Ark().V1().VolumeSnapshotLocations().Informer().GetStore().Add(snapshotLocation))
+		require.NoError(t, td.sharedInformers.Velero().V1().VolumeSnapshotLocations().Informer().GetStore().Add(snapshotLocation))
 
-		// Clear out req labels to make sure the controller adds them
-		td.req.Labels = make(map[string]string)
+		// Clear out req labels to make sure the controller adds them and does not
+		// panic when encountering a nil Labels map
+		// (https://github.com/vmware-tanzu/velero/issues/1546)
+		td.req.Labels = nil
 
 		td.client.PrependReactor("get", "backups", func(action core.Action) (bool, runtime.Object, error) {
 			return true, backup, nil
 		})
-		td.blockStore.SnapshotsTaken.Insert("snap-1")
+		td.volumeSnapshotter.SnapshotsTaken.Insert("snap-1")
 
 		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
 			return true, td.req, nil
@@ -526,9 +491,9 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 		}
 
 		pluginManager := &pluginmocks.Manager{}
-		pluginManager.On("GetBlockStore", "provider-1").Return(td.blockStore, nil)
+		pluginManager.On("GetVolumeSnapshotter", "provider-1").Return(td.volumeSnapshotter, nil)
 		pluginManager.On("CleanupClients")
-		td.controller.newPluginManager = func(logrus.FieldLogger) plugin.Manager { return pluginManager }
+		td.controller.newPluginManager = func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager }
 
 		td.backupStore.On("GetBackupVolumeSnapshots", td.req.Spec.BackupName).Return(snapshots, nil)
 		td.backupStore.On("DeleteBackup", td.req.Spec.BackupName).Return(nil)
@@ -543,7 +508,8 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
-				[]byte(`{"metadata":{"labels":{"ark.heptio.com/backup-name":"foo"}},"status":{"phase":"InProgress"}}`),
+				types.MergePatchType,
+				[]byte(`{"metadata":{"labels":{"velero.io/backup-name":"foo"}},"status":{"phase":"InProgress"}}`),
 			),
 			core.NewGetAction(
 				v1.SchemeGroupVersion.WithResource("backups"),
@@ -554,12 +520,14 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
-				[]byte(`{"metadata":{"labels":{"ark.heptio.com/backup-uid":"uid"}}}`),
+				types.MergePatchType,
+				[]byte(`{"metadata":{"labels":{"velero.io/backup-uid":"uid"}}}`),
 			),
 			core.NewPatchAction(
 				v1.SchemeGroupVersion.WithResource("backups"),
 				td.req.Namespace,
 				td.req.Spec.BackupName,
+				types.MergePatchType,
 				[]byte(`{"status":{"phase":"Deleting"}}`),
 			),
 			core.NewDeleteAction(
@@ -581,6 +549,7 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
 				td.req.Namespace,
 				td.req.Name,
+				types.MergePatchType,
 				[]byte(`{"status":{"phase":"Processed"}}`),
 			),
 			core.NewDeleteCollectionAction(
@@ -590,10 +559,169 @@ func TestBackupDeletionControllerProcessRequest(t *testing.T) {
 			),
 		}
 
-		arktest.CompareActions(t, expectedActions, td.client.Actions())
+		velerotest.CompareActions(t, expectedActions, td.client.Actions())
 
 		// Make sure snapshot was deleted
-		assert.Equal(t, 0, td.blockStore.SnapshotsTaken.Len())
+		assert.Equal(t, 0, td.volumeSnapshotter.SnapshotsTaken.Len())
+	})
+
+	t.Run("full delete, no errors, with backup name greater than 63 chars", func(t *testing.T) {
+		backup := defaultBackup().
+			ObjectMeta(
+				builder.WithName("the-really-long-backup-name-that-is-much-more-than-63-characters"),
+			).
+			Result()
+		backup.UID = "uid"
+		backup.Spec.StorageLocation = "primary"
+
+		restore1 := builder.ForRestore("velero", "restore-1").
+			Phase(v1.RestorePhaseCompleted).
+			Backup("the-really-long-backup-name-that-is-much-more-than-63-characters").
+			Result()
+		restore2 := builder.ForRestore("velero", "restore-2").
+			Phase(v1.RestorePhaseCompleted).
+			Backup("the-really-long-backup-name-that-is-much-more-than-63-characters").
+			Result()
+		restore3 := builder.ForRestore("velero", "restore-3").
+			Phase(v1.RestorePhaseCompleted).
+			Backup("some-other-backup").
+			Result()
+
+		td := setupBackupDeletionControllerTest(backup, restore1, restore2, restore3)
+		td.req = pkgbackup.NewDeleteBackupRequest(backup.Name, string(backup.UID))
+		td.req.Namespace = "velero"
+		td.req.Name = "foo-abcde"
+		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore1)
+		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore2)
+		td.sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(restore3)
+
+		location := &v1.BackupStorageLocation{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: backup.Namespace,
+				Name:      backup.Spec.StorageLocation,
+			},
+			Spec: v1.BackupStorageLocationSpec{
+				Provider: "objStoreProvider",
+				StorageType: v1.StorageType{
+					ObjectStorage: &v1.ObjectStorageLocation{
+						Bucket: "bucket",
+					},
+				},
+			},
+		}
+		require.NoError(t, td.sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(location))
+
+		snapshotLocation := &v1.VolumeSnapshotLocation{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: backup.Namespace,
+				Name:      "vsl-1",
+			},
+			Spec: v1.VolumeSnapshotLocationSpec{
+				Provider: "provider-1",
+			},
+		}
+		require.NoError(t, td.sharedInformers.Velero().V1().VolumeSnapshotLocations().Informer().GetStore().Add(snapshotLocation))
+
+		// Clear out req labels to make sure the controller adds them
+		td.req.Labels = make(map[string]string)
+
+		td.client.PrependReactor("get", "backups", func(action core.Action) (bool, runtime.Object, error) {
+			return true, backup, nil
+		})
+		td.volumeSnapshotter.SnapshotsTaken.Insert("snap-1")
+
+		td.client.PrependReactor("patch", "deletebackuprequests", func(action core.Action) (bool, runtime.Object, error) {
+			return true, td.req, nil
+		})
+
+		td.client.PrependReactor("patch", "backups", func(action core.Action) (bool, runtime.Object, error) {
+			return true, backup, nil
+		})
+
+		snapshots := []*volume.Snapshot{
+			{
+				Spec: volume.SnapshotSpec{
+					Location: "vsl-1",
+				},
+				Status: volume.SnapshotStatus{
+					ProviderSnapshotID: "snap-1",
+				},
+			},
+		}
+
+		pluginManager := &pluginmocks.Manager{}
+		pluginManager.On("GetVolumeSnapshotter", "provider-1").Return(td.volumeSnapshotter, nil)
+		pluginManager.On("CleanupClients")
+		td.controller.newPluginManager = func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager }
+
+		td.backupStore.On("GetBackupVolumeSnapshots", td.req.Spec.BackupName).Return(snapshots, nil)
+		td.backupStore.On("DeleteBackup", td.req.Spec.BackupName).Return(nil)
+		td.backupStore.On("DeleteRestore", "restore-1").Return(nil)
+		td.backupStore.On("DeleteRestore", "restore-2").Return(nil)
+
+		err := td.controller.processRequest(td.req)
+		require.NoError(t, err)
+
+		expectedActions := []core.Action{
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				td.req.Namespace,
+				td.req.Name,
+				types.MergePatchType,
+				[]byte(`{"metadata":{"labels":{"velero.io/backup-name":"the-really-long-backup-name-that-is-much-more-than-63-cha6ca4bc"}},"status":{"phase":"InProgress"}}`),
+			),
+			core.NewGetAction(
+				v1.SchemeGroupVersion.WithResource("backups"),
+				td.req.Namespace,
+				td.req.Spec.BackupName,
+			),
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				td.req.Namespace,
+				td.req.Name,
+				types.MergePatchType,
+				[]byte(`{"metadata":{"labels":{"velero.io/backup-uid":"uid"}}}`),
+			),
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("backups"),
+				td.req.Namespace,
+				td.req.Spec.BackupName,
+				types.MergePatchType,
+				[]byte(`{"status":{"phase":"Deleting"}}`),
+			),
+			core.NewDeleteAction(
+				v1.SchemeGroupVersion.WithResource("restores"),
+				td.req.Namespace,
+				"restore-1",
+			),
+			core.NewDeleteAction(
+				v1.SchemeGroupVersion.WithResource("restores"),
+				td.req.Namespace,
+				"restore-2",
+			),
+			core.NewDeleteAction(
+				v1.SchemeGroupVersion.WithResource("backups"),
+				td.req.Namespace,
+				td.req.Spec.BackupName,
+			),
+			core.NewPatchAction(
+				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				td.req.Namespace,
+				td.req.Name,
+				types.MergePatchType,
+				[]byte(`{"status":{"phase":"Processed"}}`),
+			),
+			core.NewDeleteCollectionAction(
+				v1.SchemeGroupVersion.WithResource("deletebackuprequests"),
+				td.req.Namespace,
+				pkgbackup.NewDeleteBackupRequestListOptions(td.req.Spec.BackupName, "uid"),
+			),
+		}
+
+		velerotest.CompareActions(t, expectedActions, td.client.Actions())
+
+		// Make sure snapshot was deleted
+		assert.Equal(t, 0, td.volumeSnapshotter.SnapshotsTaken.Len())
 	})
 }
 
@@ -711,18 +839,19 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 			sharedInformers := informers.NewSharedInformerFactory(client, 0)
 
 			controller := NewBackupDeletionController(
-				arktest.NewLogger(),
-				sharedInformers.Ark().V1().DeleteBackupRequests(),
-				client.ArkV1(), // deleteBackupRequestClient
-				client.ArkV1(), // backupClient
-				sharedInformers.Ark().V1().Restores(),
-				client.ArkV1(), // restoreClient
+				velerotest.NewLogger(),
+				sharedInformers.Velero().V1().DeleteBackupRequests(),
+				client.VeleroV1(), // deleteBackupRequestClient
+				client.VeleroV1(), // backupClient
+				sharedInformers.Velero().V1().Restores(),
+				client.VeleroV1(), // restoreClient
 				NewBackupTracker(),
 				nil,
-				sharedInformers.Ark().V1().PodVolumeBackups(),
-				sharedInformers.Ark().V1().BackupStorageLocations(),
-				sharedInformers.Ark().V1().VolumeSnapshotLocations(),
+				sharedInformers.Velero().V1().PodVolumeBackups(),
+				sharedInformers.Velero().V1().BackupStorageLocations(),
+				sharedInformers.Velero().V1().VolumeSnapshotLocations(),
 				nil, // new plugin manager func
+				metrics.NewServerMetrics(),
 			).(*backupDeletionController)
 
 			fakeClock := &clock.FakeClock{}
@@ -730,7 +859,7 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 			controller.clock = fakeClock
 
 			for i := range test.requests {
-				sharedInformers.Ark().V1().DeleteBackupRequests().Informer().GetStore().Add(test.requests[i])
+				sharedInformers.Velero().V1().DeleteBackupRequests().Informer().GetStore().Add(test.requests[i])
 			}
 
 			controller.deleteExpiredRequests()
@@ -740,7 +869,7 @@ func TestBackupDeletionControllerDeleteExpiredRequests(t *testing.T) {
 				expectedActions = append(expectedActions, core.NewDeleteAction(v1.SchemeGroupVersion.WithResource("deletebackuprequests"), "ns", name))
 			}
 
-			arktest.CompareActions(t, expectedActions, client.Actions())
+			velerotest.CompareActions(t, expectedActions, client.Actions())
 		})
 	}
 }

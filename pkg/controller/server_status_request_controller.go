@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,12 +26,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/tools/cache"
 
-	arkv1api "github.com/heptio/ark/pkg/apis/ark/v1"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	arkv1informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
-	arkv1listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
-	"github.com/heptio/ark/pkg/serverstatusrequest"
-	kubeutil "github.com/heptio/ark/pkg/util/kube"
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	velerov1informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
+	velerov1listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	"github.com/vmware-tanzu/velero/pkg/serverstatusrequest"
+	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 const statusRequestResyncPeriod = 5 * time.Minute
@@ -39,20 +40,23 @@ const statusRequestResyncPeriod = 5 * time.Minute
 type statusRequestController struct {
 	*genericController
 
-	client arkv1client.ServerStatusRequestsGetter
-	lister arkv1listers.ServerStatusRequestLister
-	clock  clock.Clock
+	client         velerov1client.ServerStatusRequestsGetter
+	lister         velerov1listers.ServerStatusRequestLister
+	pluginRegistry clientmgmt.Registry
+	clock          clock.Clock
 }
 
 func NewServerStatusRequestController(
 	logger logrus.FieldLogger,
-	client arkv1client.ServerStatusRequestsGetter,
-	informer arkv1informers.ServerStatusRequestInformer,
+	client velerov1client.ServerStatusRequestsGetter,
+	informer velerov1informers.ServerStatusRequestInformer,
+	pluginRegistry clientmgmt.Registry,
 ) *statusRequestController {
 	c := &statusRequestController{
 		genericController: newGenericController("serverstatusrequest", logger),
 		client:            client,
 		lister:            informer.Lister(),
+		pluginRegistry:    pluginRegistry,
 
 		clock: clock.RealClock{},
 	}
@@ -66,7 +70,7 @@ func NewServerStatusRequestController(
 	informer.Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				req := obj.(*arkv1api.ServerStatusRequest)
+				req := obj.(*velerov1api.ServerStatusRequest)
 				key := kubeutil.NamespaceAndName(req)
 
 				c.logger.WithFields(logrus.Fields{
@@ -102,7 +106,7 @@ func (c *statusRequestController) processItem(key string) error {
 		return errors.Wrap(err, "error getting ServerStatusRequest")
 	}
 
-	return serverstatusrequest.Process(req.DeepCopy(), c.client, c.clock, log)
+	return serverstatusrequest.Process(req.DeepCopy(), c.client, c.pluginRegistry, c.clock, log)
 }
 
 func (c *statusRequestController) enqueueAllItems() {

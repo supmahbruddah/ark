@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	arktest "github.com/heptio/ark/pkg/util/test"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
 var mergedServiceAccountsBenchmarkResult *unstructured.Unstructured
@@ -38,7 +38,7 @@ func BenchmarkMergeServiceAccountBasic(b *testing.B) {
 	}{
 		{
 			name: "only default tokens present",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -51,7 +51,7 @@ func BenchmarkMergeServiceAccountBasic(b *testing.B) {
 					]
 				}`,
 			),
-			fromBackup: arktest.UnstructuredOrDie(
+			fromBackup: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",
@@ -67,7 +67,7 @@ func BenchmarkMergeServiceAccountBasic(b *testing.B) {
 		},
 		{
 			name: "service accounts with multiple secrets",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -83,7 +83,7 @@ func BenchmarkMergeServiceAccountBasic(b *testing.B) {
 				}`,
 			),
 
-			fromBackup: arktest.UnstructuredOrDie(
+			fromBackup: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",
@@ -101,7 +101,7 @@ func BenchmarkMergeServiceAccountBasic(b *testing.B) {
 		},
 		{
 			name: "service accounts with labels and annotations",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -126,7 +126,7 @@ func BenchmarkMergeServiceAccountBasic(b *testing.B) {
 				}`,
 			),
 
-			fromBackup: arktest.UnstructuredOrDie(
+			fromBackup: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",
@@ -315,6 +315,60 @@ func stripWhitespace(s string) string {
 	}, s)
 }
 
+func TestMergeMaps(t *testing.T) {
+	var testCases = []struct {
+		name        string
+		source      map[string]string
+		destination map[string]string
+		expected    map[string]string
+	}{
+		{
+			name:        "nil destination should result in source being copied",
+			destination: nil,
+			source: map[string]string{
+				"k1": "v1",
+			},
+			expected: map[string]string{
+				"k1": "v1",
+			},
+		},
+		{
+			name: "keys missing from destination should be copied from source",
+			destination: map[string]string{
+				"k2": "v2",
+			},
+			source: map[string]string{
+				"k1": "v1",
+			},
+			expected: map[string]string{
+				"k1": "v1",
+				"k2": "v2",
+			},
+		},
+		{
+			name: "matching key should not have value copied from source",
+			destination: map[string]string{
+				"k1": "v1",
+			},
+			source: map[string]string{
+				"k1": "v2",
+			},
+			expected: map[string]string{
+				"k1": "v1",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			result := mergeMaps(tc.destination, tc.source)
+
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
 func TestGeneratePatch(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -325,7 +379,7 @@ func TestGeneratePatch(t *testing.T) {
 	}{
 		{
 			name: "objects are equal, no patch needed",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -338,7 +392,7 @@ func TestGeneratePatch(t *testing.T) {
 					]
 				}`,
 			),
-			desired: arktest.UnstructuredOrDie(
+			desired: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -356,7 +410,7 @@ func TestGeneratePatch(t *testing.T) {
 		},
 		{
 			name: "patch is required when labels are present",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -369,7 +423,7 @@ func TestGeneratePatch(t *testing.T) {
 					]
 				}`,
 			),
-			desired: arktest.UnstructuredOrDie(
+			desired: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -400,7 +454,7 @@ func TestGeneratePatch(t *testing.T) {
 		},
 		{
 			name: "patch is required when annotations are present",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -413,7 +467,7 @@ func TestGeneratePatch(t *testing.T) {
 					]
 				}`,
 			),
-			desired: arktest.UnstructuredOrDie(
+			desired: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -444,7 +498,7 @@ func TestGeneratePatch(t *testing.T) {
 		},
 		{
 			name: "patch is required many secrets are present",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -457,7 +511,7 @@ func TestGeneratePatch(t *testing.T) {
 					]
 				}`,
 			),
-			desired: arktest.UnstructuredOrDie(
+			desired: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -505,7 +559,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 	}{
 		{
 			name: "only default token",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -520,7 +574,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 			),
 			// fromBackup doesn't have the default token because it is expected to already have been removed
 			// by the service account action
-			fromBackup: arktest.UnstructuredOrDie(
+			fromBackup: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",
@@ -531,7 +585,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 					"secrets": []
 				}`,
 			),
-			expectedRes: arktest.UnstructuredOrDie(
+			expectedRes: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -547,7 +601,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 		},
 		{
 			name: "service accounts with multiple secrets",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -564,7 +618,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 			),
 			// fromBackup doesn't have the default token because it is expected to already have been removed
 			// by the service account action
-			fromBackup: arktest.UnstructuredOrDie(
+			fromBackup: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",
@@ -578,7 +632,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 					]
 				}`,
 			),
-			expectedRes: arktest.UnstructuredOrDie(
+			expectedRes: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -598,7 +652,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 		},
 		{
 			name: "service accounts with labels and annotations",
-			fromCluster: arktest.UnstructuredOrDie(
+			fromCluster: velerotest.UnstructuredOrDie(
 				`{
 					"apiVersion": "v1",
 					"kind": "ServiceAccount",
@@ -624,7 +678,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 			),
 			// fromBackup doesn't have the default token because it is expected to already have been removed
 			// by the service account action
-			fromBackup: arktest.UnstructuredOrDie(
+			fromBackup: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",
@@ -650,7 +704,7 @@ func TestMergeServiceAccountBasic(t *testing.T) {
 					"secrets": []
 				}`,
 			),
-			expectedRes: arktest.UnstructuredOrDie(
+			expectedRes: velerotest.UnstructuredOrDie(
 				`{
 					"kind": "ServiceAccount",
 					"apiVersion": "v1",

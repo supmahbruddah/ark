@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,17 +23,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	"github.com/heptio/ark/pkg/kuberesource"
-	arktest "github.com/heptio/ark/pkg/util/test"
+	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
 func TestPodActionAppliesTo(t *testing.T) {
-	a := NewPodAction(arktest.NewLogger())
+	a := NewPodAction(velerotest.NewLogger())
 
 	actual, err := a.AppliesTo()
 	require.NoError(t, err)
 
-	expected := ResourceSelector{
+	expected := velero.ResourceSelector{
 		IncludedResources: []string{"pods"},
 	}
 	assert.Equal(t, expected, actual)
@@ -43,11 +44,11 @@ func TestPodActionExecute(t *testing.T) {
 	tests := []struct {
 		name     string
 		pod      runtime.Unstructured
-		expected []ResourceIdentifier
+		expected []velero.ResourceIdentifier
 	}{
 		{
 			name: "no spec.volumes",
-			pod: arktest.UnstructuredOrDie(`
+			pod: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "Pod",
@@ -60,7 +61,7 @@ func TestPodActionExecute(t *testing.T) {
 		},
 		{
 			name: "persistentVolumeClaim without claimName",
-			pod: arktest.UnstructuredOrDie(`
+			pod: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "Pod",
@@ -80,7 +81,7 @@ func TestPodActionExecute(t *testing.T) {
 		},
 		{
 			name: "full test, mix of volume types",
-			pod: arktest.UnstructuredOrDie(`
+			pod: velerotest.UnstructuredOrDie(`
 			{
 				"apiVersion": "v1",
 				"kind": "Pod",
@@ -109,7 +110,7 @@ func TestPodActionExecute(t *testing.T) {
 				}
 			}
 			`),
-			expected: []ResourceIdentifier{
+			expected: []velero.ResourceIdentifier{
 				{GroupResource: kuberesource.PersistentVolumeClaims, Namespace: "foo", Name: "claim1"},
 				{GroupResource: kuberesource.PersistentVolumeClaims, Namespace: "foo", Name: "claim2"},
 			},
@@ -118,7 +119,7 @@ func TestPodActionExecute(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			a := NewPodAction(arktest.NewLogger())
+			a := NewPodAction(velerotest.NewLogger())
 
 			updated, additionalItems, err := a.Execute(test.pod, nil)
 			require.NoError(t, err)

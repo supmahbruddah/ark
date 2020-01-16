@@ -1,5 +1,5 @@
 /*
-Copyright the Heptio Ark contributors.
+Copyright the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,9 +23,9 @@ import (
 	sync "sync"
 	time "time"
 
-	versioned "github.com/heptio/ark/pkg/generated/clientset/versioned"
-	ark "github.com/heptio/ark/pkg/generated/informers/externalversions/ark"
-	internalinterfaces "github.com/heptio/ark/pkg/generated/informers/externalversions/internalinterfaces"
+	versioned "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned"
+	internalinterfaces "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/internalinterfaces"
+	velero "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -172,9 +172,9 @@ type SharedInformerFactory interface {
 	ForResource(resource schema.GroupVersionResource) (GenericInformer, error)
 	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
 
-	Ark() ark.Interface
+	Velero() velero.Interface
 }
 
-func (f *sharedInformerFactory) Ark() ark.Interface {
-	return ark.New(f, f.namespace, f.tweakListOptions)
+func (f *sharedInformerFactory) Velero() velero.Interface {
+	return velero.New(f, f.namespace, f.tweakListOptions)
 }

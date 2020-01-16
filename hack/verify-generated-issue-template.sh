@@ -1,6 +1,6 @@
 #!/bin/bash -e
 #
-# Copyright 2018 the Heptio Ark contributors.
+# Copyright 2018 the Velero contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARK_ROOT=$(dirname ${BASH_SOURCE})/..
+VELERO_ROOT=$(dirname ${BASH_SOURCE})/..
 HACK_DIR=$(dirname "${BASH_SOURCE}")
-ISSUE_TEMPLATE_FILE=${ARK_ROOT}/.github/ISSUE_TEMPLATE/bug_report.md
+ISSUE_TEMPLATE_FILE=${VELERO_ROOT}/.github/ISSUE_TEMPLATE/bug_report.md
 OUT_TMP_FILE="$(mktemp -d)"/bug_report.md
 
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"io/ioutil"
 	"testing"
 	"time"
@@ -30,23 +29,26 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions"
-	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
-	"github.com/heptio/ark/pkg/metrics"
-	"github.com/heptio/ark/pkg/persistence"
-	persistencemocks "github.com/heptio/ark/pkg/persistence/mocks"
-	"github.com/heptio/ark/pkg/plugin"
-	pluginmocks "github.com/heptio/ark/pkg/plugin/mocks"
-	"github.com/heptio/ark/pkg/restore"
-	"github.com/heptio/ark/pkg/util/collections"
-	arktest "github.com/heptio/ark/pkg/util/test"
-	"github.com/heptio/ark/pkg/volume"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/fake"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions"
+	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/metrics"
+	"github.com/vmware-tanzu/velero/pkg/persistence"
+	persistencemocks "github.com/vmware-tanzu/velero/pkg/persistence/mocks"
+	"github.com/vmware-tanzu/velero/pkg/plugin/clientmgmt"
+	pluginmocks "github.com/vmware-tanzu/velero/pkg/plugin/mocks"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	pkgrestore "github.com/vmware-tanzu/velero/pkg/restore"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
+	"github.com/vmware-tanzu/velero/pkg/util/logging"
+	"github.com/vmware-tanzu/velero/pkg/volume"
 )
 
 func TestFetchBackupInfo(t *testing.T) {
@@ -63,17 +65,17 @@ func TestFetchBackupInfo(t *testing.T) {
 		{
 			name:              "lister has backup",
 			backupName:        "backup-1",
-			informerLocations: []*api.BackupStorageLocation{arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation},
-			informerBackups:   []*api.Backup{arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup},
-			expectedRes:       arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			informerLocations: []*api.BackupStorageLocation{builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Result()},
+			informerBackups:   []*api.Backup{defaultBackup().StorageLocation("default").Result()},
+			expectedRes:       defaultBackup().StorageLocation("default").Result(),
 		},
 		{
 			name:              "lister does not have a backup, but backupSvc does",
 			backupName:        "backup-1",
-			backupStoreBackup: arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
-			informerLocations: []*api.BackupStorageLocation{arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation},
-			informerBackups:   []*api.Backup{arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup},
-			expectedRes:       arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			backupStoreBackup: defaultBackup().StorageLocation("default").Result(),
+			informerLocations: []*api.BackupStorageLocation{builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Result()},
+			informerBackups:   []*api.Backup{defaultBackup().StorageLocation("default").Result()},
+			expectedRes:       defaultBackup().StorageLocation("default").Result(),
 		},
 		{
 			name:             "no backup",
@@ -83,13 +85,15 @@ func TestFetchBackupInfo(t *testing.T) {
 		},
 	}
 
+	formatFlag := logging.FormatText
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var (
 				client          = fake.NewSimpleClientset()
 				restorer        = &fakeRestorer{}
 				sharedInformers = informers.NewSharedInformerFactory(client, 0)
-				logger          = arktest.NewLogger()
+				logger          = velerotest.NewLogger()
 				pluginManager   = &pluginmocks.Manager{}
 				backupStore     = &persistencemocks.BackupStore{}
 			)
@@ -99,18 +103,19 @@ func TestFetchBackupInfo(t *testing.T) {
 
 			c := NewRestoreController(
 				api.DefaultNamespace,
-				sharedInformers.Ark().V1().Restores(),
-				client.ArkV1(),
-				client.ArkV1(),
+				sharedInformers.Velero().V1().Restores(),
+				client.VeleroV1(),
+				client.VeleroV1(),
 				restorer,
-				sharedInformers.Ark().V1().Backups(),
-				sharedInformers.Ark().V1().BackupStorageLocations(),
-				sharedInformers.Ark().V1().VolumeSnapshotLocations(),
+				sharedInformers.Velero().V1().Backups(),
+				sharedInformers.Velero().V1().BackupStorageLocations(),
+				sharedInformers.Velero().V1().VolumeSnapshotLocations(),
 				logger,
 				logrus.InfoLevel,
-				func(logrus.FieldLogger) plugin.Manager { return pluginManager },
+				func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
 				"default",
 				metrics.NewServerMetrics(),
+				formatFlag,
 			).(*restoreController)
 
 			c.newBackupStore = func(*api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error) {
@@ -119,11 +124,11 @@ func TestFetchBackupInfo(t *testing.T) {
 
 			if test.backupStoreError == nil {
 				for _, itm := range test.informerLocations {
-					sharedInformers.Ark().V1().BackupStorageLocations().Informer().GetStore().Add(itm)
+					sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(itm)
 				}
 
 				for _, itm := range test.informerBackups {
-					sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(itm)
+					sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(itm)
 				}
 			}
 
@@ -148,7 +153,7 @@ func TestFetchBackupInfo(t *testing.T) {
 	}
 }
 
-func TestProcessRestoreSkips(t *testing.T) {
+func TestProcessQueueItemSkips(t *testing.T) {
 	tests := []struct {
 		name        string
 		restoreKey  string
@@ -167,19 +172,21 @@ func TestProcessRestoreSkips(t *testing.T) {
 		{
 			name:       "restore with phase InProgress does not get processed",
 			restoreKey: "foo/bar",
-			restore:    arktest.NewTestRestore("foo", "bar", api.RestorePhaseInProgress).Restore,
+			restore:    builder.ForRestore("foo", "bar").Phase(api.RestorePhaseInProgress).Result(),
 		},
 		{
 			name:       "restore with phase Completed does not get processed",
 			restoreKey: "foo/bar",
-			restore:    arktest.NewTestRestore("foo", "bar", api.RestorePhaseCompleted).Restore,
+			restore:    builder.ForRestore("foo", "bar").Phase(api.RestorePhaseCompleted).Result(),
 		},
 		{
 			name:       "restore with phase FailedValidation does not get processed",
 			restoreKey: "foo/bar",
-			restore:    arktest.NewTestRestore("foo", "bar", api.RestorePhaseFailedValidation).Restore,
+			restore:    builder.ForRestore("foo", "bar").Phase(api.RestorePhaseFailedValidation).Result(),
 		},
 	}
+
+	formatFlag := logging.FormatText
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -187,37 +194,40 @@ func TestProcessRestoreSkips(t *testing.T) {
 				client          = fake.NewSimpleClientset()
 				restorer        = &fakeRestorer{}
 				sharedInformers = informers.NewSharedInformerFactory(client, 0)
-				logger          = arktest.NewLogger()
+				logger          = velerotest.NewLogger()
 			)
 
 			c := NewRestoreController(
 				api.DefaultNamespace,
-				sharedInformers.Ark().V1().Restores(),
-				client.ArkV1(),
-				client.ArkV1(),
+				sharedInformers.Velero().V1().Restores(),
+				client.VeleroV1(),
+				client.VeleroV1(),
 				restorer,
-				sharedInformers.Ark().V1().Backups(),
-				sharedInformers.Ark().V1().BackupStorageLocations(),
-				sharedInformers.Ark().V1().VolumeSnapshotLocations(),
+				sharedInformers.Velero().V1().Backups(),
+				sharedInformers.Velero().V1().BackupStorageLocations(),
+				sharedInformers.Velero().V1().VolumeSnapshotLocations(),
 				logger,
 				logrus.InfoLevel,
 				nil,
 				"default",
 				metrics.NewServerMetrics(),
+				formatFlag,
 			).(*restoreController)
 
 			if test.restore != nil {
-				sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(test.restore)
+				sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(test.restore)
 			}
 
-			err := c.processRestore(test.restoreKey)
+			err := c.processQueueItem(test.restoreKey)
 
 			assert.Equal(t, test.expectError, err != nil)
 		})
 	}
 }
 
-func TestProcessRestore(t *testing.T) {
+func TestProcessQueueItem(t *testing.T) {
+	defaultStorageLocation := builder.ForBackupStorageLocation("velero", "default").Provider("myCloud").Bucket("bucket").Result()
+
 	tests := []struct {
 		name                            string
 		restoreKey                      string
@@ -237,84 +247,79 @@ func TestProcessRestore(t *testing.T) {
 	}{
 		{
 			name:                     "restore with both namespace in both includedNamespaces and excludedNamespaces fails validation",
-			location:                 arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:                  NewRestore("foo", "bar", "backup-1", "another-1", "*", api.RestorePhaseNew).WithExcludedNamespace("another-1").Restore,
-			backup:                   arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:                 defaultStorageLocation,
+			restore:                  NewRestore("foo", "bar", "backup-1", "another-1", "*", api.RestorePhaseNew).ExcludedNamespaces("another-1").Result(),
+			backup:                   defaultBackup().StorageLocation("default").Result(),
 			expectedErr:              false,
 			expectedPhase:            string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{"Invalid included/excluded namespace lists: excludes list cannot contain an item in the includes list: another-1"},
 		},
 		{
 			name:                     "restore with resource in both includedResources and excludedResources fails validation",
-			location:                 arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:                  NewRestore("foo", "bar", "backup-1", "*", "a-resource", api.RestorePhaseNew).WithExcludedResource("a-resource").Restore,
-			backup:                   arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:                 defaultStorageLocation,
+			restore:                  NewRestore("foo", "bar", "backup-1", "*", "a-resource", api.RestorePhaseNew).ExcludedResources("a-resource").Result(),
+			backup:                   defaultBackup().StorageLocation("default").Result(),
 			expectedErr:              false,
 			expectedPhase:            string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{"Invalid included/excluded resource lists: excludes list cannot contain an item in the includes list: a-resource"},
 		},
 		{
 			name:                     "new restore with empty backup and schedule names fails validation",
-			restore:                  NewRestore("foo", "bar", "", "ns-1", "", api.RestorePhaseNew).Restore,
+			restore:                  NewRestore("foo", "bar", "", "ns-1", "", api.RestorePhaseNew).Result(),
 			expectedErr:              false,
 			expectedPhase:            string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{"Either a backup or schedule must be specified as a source for the restore, but not both"},
 		},
 		{
 			name:                     "new restore with backup and schedule names provided fails validation",
-			restore:                  NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).WithSchedule("sched-1").Restore,
+			restore:                  NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Schedule("sched-1").Result(),
 			expectedErr:              false,
 			expectedPhase:            string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{"Either a backup or schedule must be specified as a source for the restore, but not both"},
 		},
 		{
-			name:     "valid restore with schedule name gets executed",
-			location: arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:  NewRestore("foo", "bar", "", "ns-1", "", api.RestorePhaseNew).WithSchedule("sched-1").Restore,
-			backup: arktest.
-				NewTestBackup().
-				WithName("backup-1").
-				WithStorageLocation("default").
-				WithLabel("ark-schedule", "sched-1").
-				WithPhase(api.BackupPhaseCompleted).
-				Backup,
+			name:                 "valid restore with schedule name gets executed",
+			location:             defaultStorageLocation,
+			restore:              NewRestore("foo", "bar", "", "ns-1", "", api.RestorePhaseNew).Schedule("sched-1").Result(),
+			backup:               defaultBackup().StorageLocation("default").ObjectMeta(builder.WithLabels(api.ScheduleNameLabel, "sched-1")).Phase(api.BackupPhaseCompleted).Result(),
 			expectedErr:          false,
 			expectedPhase:        string(api.RestorePhaseInProgress),
-			expectedRestorerCall: NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseInProgress).WithSchedule("sched-1").Restore,
+			expectedRestorerCall: NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseInProgress).Schedule("sched-1").Result(),
 		},
 		{
 			name:                            "restore with non-existent backup name fails",
-			restore:                         NewRestore("foo", "bar", "backup-1", "ns-1", "*", api.RestorePhaseNew).Restore,
+			restore:                         NewRestore("foo", "bar", "backup-1", "ns-1", "*", api.RestorePhaseNew).Result(),
 			expectedErr:                     false,
 			expectedPhase:                   string(api.RestorePhaseFailedValidation),
-			expectedValidationErrors:        []string{"Error retrieving backup: backup.ark.heptio.com \"backup-1\" not found"},
+			expectedValidationErrors:        []string{"Error retrieving backup: backup.velero.io \"backup-1\" not found"},
 			backupStoreGetBackupMetadataErr: errors.New("no backup here"),
 		},
 		{
 			name:                  "restorer throwing an error causes the restore to fail",
-			location:              arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:               NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Restore,
-			backup:                arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:              defaultStorageLocation,
+			restore:               NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Result(),
+			backup:                defaultBackup().StorageLocation("default").Result(),
 			restorerError:         errors.New("blarg"),
 			expectedErr:           false,
 			expectedPhase:         string(api.RestorePhaseInProgress),
+			expectedFinalPhase:    string(api.RestorePhasePartiallyFailed),
 			expectedRestoreErrors: 1,
-			expectedRestorerCall:  NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseInProgress).Restore,
+			expectedRestorerCall:  NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseInProgress).Result(),
 		},
 		{
 			name:                 "valid restore gets executed",
-			location:             arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:              NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Restore,
-			backup:               arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:             defaultStorageLocation,
+			restore:              NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Result(),
+			backup:               defaultBackup().StorageLocation("default").Result(),
 			expectedErr:          false,
 			expectedPhase:        string(api.RestorePhaseInProgress),
-			expectedRestorerCall: NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseInProgress).Restore,
+			expectedRestorerCall: NewRestore("foo", "bar", "backup-1", "ns-1", "", api.RestorePhaseInProgress).Result(),
 		},
 		{
 			name:          "restoration of nodes is not supported",
-			location:      arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "nodes", api.RestorePhaseNew).Restore,
-			backup:        arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:      defaultStorageLocation,
+			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "nodes", api.RestorePhaseNew).Result(),
+			backup:        defaultBackup().StorageLocation("default").Result(),
 			expectedErr:   false,
 			expectedPhase: string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{
@@ -324,9 +329,9 @@ func TestProcessRestore(t *testing.T) {
 		},
 		{
 			name:          "restoration of events is not supported",
-			location:      arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "events", api.RestorePhaseNew).Restore,
-			backup:        arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:      defaultStorageLocation,
+			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "events", api.RestorePhaseNew).Result(),
+			backup:        defaultBackup().StorageLocation("default").Result(),
 			expectedErr:   false,
 			expectedPhase: string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{
@@ -336,9 +341,9 @@ func TestProcessRestore(t *testing.T) {
 		},
 		{
 			name:          "restoration of events.events.k8s.io is not supported",
-			location:      arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "events.events.k8s.io", api.RestorePhaseNew).Restore,
-			backup:        arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			location:      defaultStorageLocation,
+			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "events.events.k8s.io", api.RestorePhaseNew).Result(),
+			backup:        defaultBackup().StorageLocation("default").Result(),
 			expectedErr:   false,
 			expectedPhase: string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{
@@ -347,39 +352,41 @@ func TestProcessRestore(t *testing.T) {
 			},
 		},
 		{
-			name:          "restoration of backups.ark.heptio.com is not supported",
-			location:      arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "backups.ark.heptio.com", api.RestorePhaseNew).Restore,
-			backup:        arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			name:          "restoration of backups.velero.io is not supported",
+			location:      defaultStorageLocation,
+			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "backups.velero.io", api.RestorePhaseNew).Result(),
+			backup:        defaultBackup().StorageLocation("default").Result(),
 			expectedErr:   false,
 			expectedPhase: string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{
-				"backups.ark.heptio.com are non-restorable resources",
-				"Invalid included/excluded resource lists: excludes list cannot contain an item in the includes list: backups.ark.heptio.com",
+				"backups.velero.io are non-restorable resources",
+				"Invalid included/excluded resource lists: excludes list cannot contain an item in the includes list: backups.velero.io",
 			},
 		},
 		{
-			name:          "restoration of restores.ark.heptio.com is not supported",
-			location:      arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "restores.ark.heptio.com", api.RestorePhaseNew).Restore,
-			backup:        arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			name:          "restoration of restores.velero.io is not supported",
+			location:      defaultStorageLocation,
+			restore:       NewRestore("foo", "bar", "backup-1", "ns-1", "restores.velero.io", api.RestorePhaseNew).Result(),
+			backup:        defaultBackup().StorageLocation("default").Result(),
 			expectedErr:   false,
 			expectedPhase: string(api.RestorePhaseFailedValidation),
 			expectedValidationErrors: []string{
-				"restores.ark.heptio.com are non-restorable resources",
-				"Invalid included/excluded resource lists: excludes list cannot contain an item in the includes list: restores.ark.heptio.com",
+				"restores.velero.io are non-restorable resources",
+				"Invalid included/excluded resource lists: excludes list cannot contain an item in the includes list: restores.velero.io",
 			},
 		},
 		{
 			name:                            "backup download error results in failed restore",
-			location:                        arktest.NewTestBackupStorageLocation().WithName("default").WithProvider("myCloud").WithObjectStorage("bucket").BackupStorageLocation,
-			restore:                         NewRestore(api.DefaultNamespace, "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Restore,
+			location:                        defaultStorageLocation,
+			restore:                         NewRestore(api.DefaultNamespace, "bar", "backup-1", "ns-1", "", api.RestorePhaseNew).Result(),
 			expectedPhase:                   string(api.RestorePhaseInProgress),
 			expectedFinalPhase:              string(api.RestorePhaseFailed),
 			backupStoreGetBackupContentsErr: errors.New("Couldn't download backup"),
-			backup:                          arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("default").Backup,
+			backup:                          defaultBackup().StorageLocation("default").Result(),
 		},
 	}
+
+	formatFlag := logging.FormatText
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -387,7 +394,7 @@ func TestProcessRestore(t *testing.T) {
 				client          = fake.NewSimpleClientset()
 				restorer        = &fakeRestorer{}
 				sharedInformers = informers.NewSharedInformerFactory(client, 0)
-				logger          = arktest.NewLogger()
+				logger          = velerotest.NewLogger()
 				pluginManager   = &pluginmocks.Manager{}
 				backupStore     = &persistencemocks.BackupStore{}
 			)
@@ -397,18 +404,19 @@ func TestProcessRestore(t *testing.T) {
 
 			c := NewRestoreController(
 				api.DefaultNamespace,
-				sharedInformers.Ark().V1().Restores(),
-				client.ArkV1(),
-				client.ArkV1(),
+				sharedInformers.Velero().V1().Restores(),
+				client.VeleroV1(),
+				client.VeleroV1(),
 				restorer,
-				sharedInformers.Ark().V1().Backups(),
-				sharedInformers.Ark().V1().BackupStorageLocations(),
-				sharedInformers.Ark().V1().VolumeSnapshotLocations(),
+				sharedInformers.Velero().V1().Backups(),
+				sharedInformers.Velero().V1().BackupStorageLocations(),
+				sharedInformers.Velero().V1().VolumeSnapshotLocations(),
 				logger,
 				logrus.InfoLevel,
-				func(logrus.FieldLogger) plugin.Manager { return pluginManager },
+				func(logrus.FieldLogger) clientmgmt.Manager { return pluginManager },
 				"default",
 				metrics.NewServerMetrics(),
+				formatFlag,
 			).(*restoreController)
 
 			c.newBackupStore = func(*api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error) {
@@ -416,14 +424,14 @@ func TestProcessRestore(t *testing.T) {
 			}
 
 			if test.location != nil {
-				sharedInformers.Ark().V1().BackupStorageLocations().Informer().GetStore().Add(test.location)
+				sharedInformers.Velero().V1().BackupStorageLocations().Informer().GetStore().Add(test.location)
 			}
 			if test.backup != nil {
-				sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(test.backup)
+				sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(test.backup)
 			}
 
 			if test.restore != nil {
-				sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(test.restore)
+				sharedInformers.Velero().V1().Restores().Informer().GetStore().Add(test.restore)
 
 				// this is necessary so the Patch() call returns the appropriate object
 				client.PrependReactor("patch", "restores", func(action core.Action) (bool, runtime.Object, error) {
@@ -439,10 +447,14 @@ func TestProcessRestore(t *testing.T) {
 						return false, nil, err
 					}
 
-					phase, err := collections.GetString(patchMap, "status.phase")
+					phase, found, err := unstructured.NestedString(patchMap, "status", "phase")
 					if err != nil {
 						t.Logf("error getting status.phase: %s\n", err)
 						return false, nil, err
+					}
+					if !found {
+						t.Logf("status.phase not found")
+						return false, nil, errors.New("status.phase not found")
 					}
 
 					res := test.restore.DeepCopy()
@@ -452,7 +464,8 @@ func TestProcessRestore(t *testing.T) {
 
 					res.Status.Phase = api.RestorePhase(phase)
 
-					if backupName, err := collections.GetString(patchMap, "spec.backupName"); err == nil {
+					backupName, found, err := unstructured.NestedString(patchMap, "spec", "backupName")
+					if found {
 						res.Spec.BackupName = backupName
 					}
 
@@ -461,15 +474,15 @@ func TestProcessRestore(t *testing.T) {
 			}
 
 			if test.backup != nil {
-				sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(test.backup)
+				sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(test.backup)
 			}
 
-			var warnings, errors api.RestoreResult
+			var warnings, errors pkgrestore.Result
 			if test.restorerError != nil {
 				errors.Namespaces = map[string][]string{"ns-1": {test.restorerError.Error()}}
 			}
 			if test.putRestoreLogErr != nil {
-				errors.Ark = append(errors.Ark, "error uploading log file to object storage: "+test.putRestoreLogErr.Error())
+				errors.Velero = append(errors.Velero, "error uploading log file to object storage: "+test.putRestoreLogErr.Error())
 			}
 			if test.expectedRestorerCall != nil {
 				backupStore.On("GetBackupContents", test.backup.Name).Return(ioutil.NopCloser(bytes.NewReader([]byte("hello world"))), nil)
@@ -517,7 +530,7 @@ func TestProcessRestore(t *testing.T) {
 				pluginManager.On("CleanupClients")
 			}
 
-			err = c.processRestore(key)
+			err = c.processQueueItem(key)
 
 			assert.Equal(t, test.expectedErr, err != nil, "got error %v", err)
 			actions := client.Actions()
@@ -566,7 +579,7 @@ func TestProcessRestore(t *testing.T) {
 				}
 			}
 
-			arktest.ValidatePatch(t, actions[0], expected, decode)
+			velerotest.ValidatePatch(t, actions[0], expected, decode)
 
 			// if we don't expect a restore, validate it wasn't called and exit the test
 			if test.expectedRestorerCall == nil {
@@ -588,13 +601,13 @@ func TestProcessRestore(t *testing.T) {
 			if test.expectedFinalPhase != "" {
 				expected = Patch{
 					Status: StatusPatch{
-						Phase:  api.RestorePhaseCompleted,
+						Phase:  api.RestorePhase(test.expectedFinalPhase),
 						Errors: test.expectedRestoreErrors,
 					},
 				}
 			}
 
-			arktest.ValidatePatch(t, actions[1], expected, decode)
+			velerotest.ValidatePatch(t, actions[2], expected, decode)
 
 			// explicitly capturing the argument passed to Restore myself because
 			// I want to validate the called arg as of the time of calling, but
@@ -604,136 +617,31 @@ func TestProcessRestore(t *testing.T) {
 	}
 }
 
-func TestValidateAndComplete(t *testing.T) {
-	tests := []struct {
-		name              string
-		storageLocation   *api.BackupStorageLocation
-		snapshotLocations []*api.VolumeSnapshotLocation
-		backup            *api.Backup
-		volumeSnapshots   []*volume.Snapshot
-		restore           *api.Restore
-		expectedErrs      []string
-	}{
-		{
-			name:            "backup with .status.volumeBackups and no volumesnapshots.json file does not error",
-			storageLocation: arktest.NewTestBackupStorageLocation().WithName("loc-1").BackupStorageLocation,
-			backup:          arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("loc-1").WithSnapshot("pv-1", "snap-1").Backup,
-			volumeSnapshots: nil,
-			restore:         arktest.NewDefaultTestRestore().WithBackup("backup-1").Restore,
-			expectedErrs:    nil,
-		},
-		{
-			name:            "backup with no .status.volumeBackups and volumesnapshots.json file does not error",
-			storageLocation: arktest.NewTestBackupStorageLocation().WithName("loc-1").BackupStorageLocation,
-			backup:          arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("loc-1").Backup,
-			volumeSnapshots: []*volume.Snapshot{{}},
-			restore:         arktest.NewDefaultTestRestore().WithBackup("backup-1").Restore,
-			expectedErrs:    nil,
-		},
-		{
-			name:            "backup with both .status.volumeBackups and volumesnapshots.json file errors",
-			storageLocation: arktest.NewTestBackupStorageLocation().WithName("loc-1").BackupStorageLocation,
-			backup:          arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("loc-1").WithSnapshot("pv-1", "snap-1").Backup,
-			volumeSnapshots: []*volume.Snapshot{{}},
-			restore:         arktest.NewDefaultTestRestore().WithBackup("backup-1").Restore,
-			expectedErrs:    []string{"Backup must not have both .status.volumeBackups and a volumesnapshots.json.gz file in object storage"},
-		},
-		{
-			name:            "backup with .status.volumeBackups, and >1 volume snapshot locations exist, errors",
-			storageLocation: arktest.NewTestBackupStorageLocation().WithName("loc-1").BackupStorageLocation,
-			snapshotLocations: []*api.VolumeSnapshotLocation{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: api.DefaultNamespace,
-						Name:      "vsl-1",
-					},
-				},
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: api.DefaultNamespace,
-						Name:      "vsl-2",
-					},
-				},
-			},
-			backup:       arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("loc-1").WithSnapshot("pv-1", "snap-1").Backup,
-			restore:      arktest.NewDefaultTestRestore().WithBackup("backup-1").Restore,
-			expectedErrs: []string{"Cannot restore backup with .status.volumeBackups when more than one volume snapshot location exists"},
-		},
-		{
-			name:            "backup with .status.volumeBackups, and 1 volume snapshot location exists, does not error",
-			storageLocation: arktest.NewTestBackupStorageLocation().WithName("loc-1").BackupStorageLocation,
-			snapshotLocations: []*api.VolumeSnapshotLocation{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: api.DefaultNamespace,
-						Name:      "vsl-1",
-					},
-				},
-			},
-			backup:       arktest.NewTestBackup().WithName("backup-1").WithStorageLocation("loc-1").WithSnapshot("pv-1", "snap-1").Backup,
-			restore:      arktest.NewDefaultTestRestore().WithBackup("backup-1").Restore,
-			expectedErrs: nil,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			var (
-				clientset       = fake.NewSimpleClientset()
-				sharedInformers = informers.NewSharedInformerFactory(clientset, 0)
-				logger          = arktest.NewLogger()
-				backupStore     = &persistencemocks.BackupStore{}
-				controller      = &restoreController{
-					genericController: &genericController{
-						logger: logger,
-					},
-					namespace:              api.DefaultNamespace,
-					backupLister:           sharedInformers.Ark().V1().Backups().Lister(),
-					backupLocationLister:   sharedInformers.Ark().V1().BackupStorageLocations().Lister(),
-					snapshotLocationLister: sharedInformers.Ark().V1().VolumeSnapshotLocations().Lister(),
-					newBackupStore: func(*api.BackupStorageLocation, persistence.ObjectStoreGetter, logrus.FieldLogger) (persistence.BackupStore, error) {
-						return backupStore, nil
-					},
-				}
-			)
-
-			require.NoError(t, sharedInformers.Ark().V1().BackupStorageLocations().Informer().GetStore().Add(tc.storageLocation))
-			require.NoError(t, sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(tc.backup))
-			for _, loc := range tc.snapshotLocations {
-				require.NoError(t, sharedInformers.Ark().V1().VolumeSnapshotLocations().Informer().GetStore().Add(loc))
-			}
-			backupStore.On("GetBackupVolumeSnapshots", tc.backup.Name).Return(tc.volumeSnapshots, nil)
-
-			controller.validateAndComplete(tc.restore, nil)
-
-			assert.Equal(t, tc.expectedErrs, tc.restore.Status.ValidationErrors)
-		})
-	}
-
-}
-
 func TestvalidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
+	formatFlag := logging.FormatText
+
 	var (
 		client          = fake.NewSimpleClientset()
 		sharedInformers = informers.NewSharedInformerFactory(client, 0)
-		logger          = arktest.NewLogger()
+		logger          = velerotest.NewLogger()
 		pluginManager   = &pluginmocks.Manager{}
 	)
 
 	c := NewRestoreController(
 		api.DefaultNamespace,
-		sharedInformers.Ark().V1().Restores(),
-		client.ArkV1(),
-		client.ArkV1(),
+		sharedInformers.Velero().V1().Restores(),
+		client.VeleroV1(),
+		client.VeleroV1(),
 		nil,
-		sharedInformers.Ark().V1().Backups(),
-		sharedInformers.Ark().V1().BackupStorageLocations(),
-		sharedInformers.Ark().V1().VolumeSnapshotLocations(),
+		sharedInformers.Velero().V1().Backups(),
+		sharedInformers.Velero().V1().BackupStorageLocations(),
+		sharedInformers.Velero().V1().VolumeSnapshotLocations(),
 		logger,
 		logrus.DebugLevel,
 		nil,
 		"default",
 		nil,
+		formatFlag,
 	).(*restoreController)
 
 	restore := &api.Restore{
@@ -747,12 +655,11 @@ func TestvalidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
 	}
 
 	// no backups created from the schedule: fail validation
-	require.NoError(t, sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(arktest.
-		NewTestBackup().
-		WithName("backup-1").
-		WithLabel("ark-schedule", "non-matching-schedule").
-		WithPhase(api.BackupPhaseCompleted).
-		Backup,
+	require.NoError(t, sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(
+		defaultBackup().
+			ObjectMeta(builder.WithLabels(api.ScheduleNameLabel, "non-matching-schedule")).
+			Phase(api.BackupPhaseCompleted).
+			Result(),
 	))
 
 	errs := c.validateAndComplete(restore, pluginManager)
@@ -760,12 +667,14 @@ func TestvalidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
 	assert.Empty(t, restore.Spec.BackupName)
 
 	// no completed backups created from the schedule: fail validation
-	require.NoError(t, sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(arktest.
-		NewTestBackup().
-		WithName("backup-2").
-		WithLabel("ark-schedule", "schedule-1").
-		WithPhase(api.BackupPhaseInProgress).
-		Backup,
+	require.NoError(t, sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(
+		defaultBackup().
+			ObjectMeta(
+				builder.WithName("backup-2"),
+				builder.WithLabels(api.ScheduleNameLabel, "schedule-1"),
+			).
+			Phase(api.BackupPhaseInProgress).
+			Result(),
 	))
 
 	errs = c.validateAndComplete(restore, pluginManager)
@@ -775,21 +684,25 @@ func TestvalidateAndCompleteWhenScheduleNameSpecified(t *testing.T) {
 	// multiple completed backups created from the schedule: use most recent
 	now := time.Now()
 
-	require.NoError(t, sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(arktest.
-		NewTestBackup().
-		WithName("foo").
-		WithLabel("ark-schedule", "schedule-1").
-		WithPhase(api.BackupPhaseCompleted).
-		WithStartTimestamp(now).
-		Backup,
+	require.NoError(t, sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(
+		defaultBackup().
+			ObjectMeta(
+				builder.WithName("foo"),
+				builder.WithLabels(api.ScheduleNameLabel, "schedule-1"),
+			).
+			Phase(api.BackupPhaseCompleted).
+			StartTimestamp(now).
+			Result(),
 	))
-	require.NoError(t, sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(arktest.
-		NewTestBackup().
-		WithName("bar").
-		WithLabel("ark-schedule", "schedule-1").
-		WithPhase(api.BackupPhaseCompleted).
-		WithStartTimestamp(now.Add(time.Second)).
-		Backup,
+	require.NoError(t, sharedInformers.Velero().V1().Backups().Informer().GetStore().Add(
+		defaultBackup().
+			ObjectMeta(
+				builder.WithName("foo"),
+				builder.WithLabels(api.ScheduleNameLabel, "schedule-1"),
+			).
+			Phase(api.BackupPhaseCompleted).
+			StartTimestamp(now.Add(time.Second)).
+			Result(),
 	))
 
 	errs = c.validateAndComplete(restore, pluginManager)
@@ -812,7 +725,6 @@ func TestBackupXorScheduleProvided(t *testing.T) {
 	r.Spec.BackupName = ""
 	r.Spec.ScheduleName = "schedule-1"
 	assert.True(t, backupXorScheduleProvided(r))
-
 }
 
 func TestMostRecentCompletedBackup(t *testing.T) {
@@ -869,7 +781,7 @@ func TestMostRecentCompletedBackup(t *testing.T) {
 		},
 		Status: api.BackupStatus{
 			Phase:          api.BackupPhaseCompleted,
-			StartTimestamp: metav1.Time{Time: now},
+			StartTimestamp: &metav1.Time{Time: now},
 		},
 	})
 
@@ -879,7 +791,7 @@ func TestMostRecentCompletedBackup(t *testing.T) {
 		},
 		Status: api.BackupStatus{
 			Phase:          api.BackupPhaseCompleted,
-			StartTimestamp: metav1.Time{Time: now.Add(time.Second)},
+			StartTimestamp: &metav1.Time{Time: now.Add(time.Second)},
 		},
 	}
 	backups = append(backups, expected)
@@ -887,20 +799,18 @@ func TestMostRecentCompletedBackup(t *testing.T) {
 	assert.Equal(t, expected, mostRecentCompletedBackup(backups))
 }
 
-func NewRestore(ns, name, backup, includeNS, includeResource string, phase api.RestorePhase) *arktest.TestRestore {
-	restore := arktest.NewTestRestore(ns, name, phase).WithBackup(backup)
+func NewRestore(ns, name, backup, includeNS, includeResource string, phase api.RestorePhase) *builder.RestoreBuilder {
+	restore := builder.ForRestore(ns, name).Phase(phase).Backup(backup)
 
 	if includeNS != "" {
-		restore = restore.WithIncludedNamespace(includeNS)
+		restore = restore.IncludedNamespaces(includeNS)
 	}
 
 	if includeResource != "" {
-		restore = restore.WithIncludedResource(includeResource)
+		restore = restore.IncludedResources(includeResource)
 	}
 
-	for _, n := range nonRestorableResources {
-		restore = restore.WithExcludedResource(n)
-	}
+	restore.ExcludedResources(nonRestorableResources...)
 
 	return restore
 }
@@ -911,18 +821,14 @@ type fakeRestorer struct {
 }
 
 func (r *fakeRestorer) Restore(
-	log logrus.FieldLogger,
-	restore *api.Restore,
-	backup *api.Backup,
-	volumeSnapshots []*volume.Snapshot,
-	backupReader io.Reader,
-	actions []restore.ItemAction,
+	info pkgrestore.Request,
+	actions []velero.RestoreItemAction,
 	snapshotLocationLister listers.VolumeSnapshotLocationLister,
-	blockStoreGetter restore.BlockStoreGetter,
-) (api.RestoreResult, api.RestoreResult) {
-	res := r.Called(log, restore, backup, backupReader, actions)
+	volumeSnapshotterGetter pkgrestore.VolumeSnapshotterGetter,
+) (pkgrestore.Result, pkgrestore.Result) {
+	res := r.Called(info.Log, info.Restore, info.Backup, info.BackupReader, actions)
 
-	r.calledWithArg = *restore
+	r.calledWithArg = *info.Restore
 
-	return res.Get(0).(api.RestoreResult), res.Get(1).(api.RestoreResult)
+	return res.Get(0).(pkgrestore.Result), res.Get(1).(pkgrestore.Result)
 }

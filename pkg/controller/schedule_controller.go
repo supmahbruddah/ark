@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,12 +32,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/tools/cache"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
-	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
-	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
-	"github.com/heptio/ark/pkg/metrics"
-	kubeutil "github.com/heptio/ark/pkg/util/kube"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/builder"
+	velerov1client "github.com/vmware-tanzu/velero/pkg/generated/clientset/versioned/typed/velero/v1"
+	informers "github.com/vmware-tanzu/velero/pkg/generated/informers/externalversions/velero/v1"
+	listers "github.com/vmware-tanzu/velero/pkg/generated/listers/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/metrics"
+	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
 const (
@@ -48,8 +49,8 @@ type scheduleController struct {
 	*genericController
 
 	namespace       string
-	schedulesClient arkv1client.SchedulesGetter
-	backupsClient   arkv1client.BackupsGetter
+	schedulesClient velerov1client.SchedulesGetter
+	backupsClient   velerov1client.BackupsGetter
 	schedulesLister listers.ScheduleLister
 	clock           clock.Clock
 	metrics         *metrics.ServerMetrics
@@ -57,8 +58,8 @@ type scheduleController struct {
 
 func NewScheduleController(
 	namespace string,
-	schedulesClient arkv1client.SchedulesGetter,
-	backupsClient arkv1client.BackupsGetter,
+	schedulesClient velerov1client.SchedulesGetter,
+	backupsClient velerov1client.BackupsGetter,
 	schedulesInformer informers.ScheduleInformer,
 	logger logrus.FieldLogger,
 	metrics *metrics.ServerMetrics,
@@ -265,7 +266,7 @@ func (c *scheduleController) submitBackupIfDue(item *api.Schedule, cronSchedule 
 	original := item
 	schedule := item.DeepCopy()
 
-	schedule.Status.LastBackup = metav1.NewTime(now)
+	schedule.Status.LastBackup = &metav1.Time{Time: now}
 
 	if _, err := patchSchedule(original, schedule, c.schedulesClient); err != nil {
 		return errors.Wrapf(err, "error updating Schedule's LastBackup time to %v", schedule.Status.LastBackup)
@@ -277,7 +278,10 @@ func (c *scheduleController) submitBackupIfDue(item *api.Schedule, cronSchedule 
 func getNextRunTime(schedule *api.Schedule, cronSchedule cron.Schedule, asOf time.Time) (bool, time.Time) {
 	// get the latest run time (if the schedule hasn't run yet, this will be the zero value which will trigger
 	// an immediate backup)
-	lastBackupTime := schedule.Status.LastBackup.Time
+	var lastBackupTime time.Time
+	if schedule.Status.LastBackup != nil {
+		lastBackupTime = schedule.Status.LastBackup.Time
+	}
 
 	nextRunTime := cronSchedule.Next(lastBackupTime)
 
@@ -285,31 +289,16 @@ func getNextRunTime(schedule *api.Schedule, cronSchedule cron.Schedule, asOf tim
 }
 
 func getBackup(item *api.Schedule, timestamp time.Time) *api.Backup {
-	backup := &api.Backup{
-		Spec: item.Spec.Template,
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: item.Namespace,
-			Name:      fmt.Sprintf("%s-%s", item.Name, timestamp.Format("20060102150405")),
-		},
-	}
-
-	// add schedule labels and 'ark-schedule' label to the backup
-	addLabelsToBackup(item, backup)
+	name := fmt.Sprintf("%s-%s", item.Name, timestamp.Format("20060102150405"))
+	backup := builder.
+		ForBackup(item.Namespace, name).
+		FromSchedule(item).
+		Result()
 
 	return backup
 }
 
-func addLabelsToBackup(item *api.Schedule, backup *api.Backup) {
-	labels := item.Labels
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	labels["ark-schedule"] = item.Name
-
-	backup.Labels = labels
-}
-
-func patchSchedule(original, updated *api.Schedule, client arkv1client.SchedulesGetter) (*api.Schedule, error) {
+func patchSchedule(original, updated *api.Schedule, client velerov1client.SchedulesGetter) (*api.Schedule, error) {
 	origBytes, err := json.Marshal(original)
 	if err != nil {
 		return nil, errors.Wrap(err, "error marshalling original schedule")

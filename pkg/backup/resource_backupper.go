@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,19 +19,21 @@ package backup
 import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	apiextv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	kuberrs "k8s.io/apimachinery/pkg/util/errors"
+	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 
-	"github.com/heptio/ark/pkg/client"
-	"github.com/heptio/ark/pkg/discovery"
-	"github.com/heptio/ark/pkg/kuberesource"
-	"github.com/heptio/ark/pkg/podexec"
-	"github.com/heptio/ark/pkg/restic"
-	"github.com/heptio/ark/pkg/util/collections"
+	"github.com/vmware-tanzu/velero/pkg/client"
+	"github.com/vmware-tanzu/velero/pkg/discovery"
+	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/podexec"
+	"github.com/vmware-tanzu/velero/pkg/restic"
+	"github.com/vmware-tanzu/velero/pkg/util/collections"
 )
 
 type resourceBackupperFactory interface {
@@ -40,13 +42,12 @@ type resourceBackupperFactory interface {
 		backupRequest *Request,
 		dynamicFactory client.DynamicFactory,
 		discoveryHelper discovery.Helper,
-		backedUpItems map[itemKey]struct{},
 		cohabitatingResources map[string]*cohabitatingResource,
 		podCommandExecutor podexec.PodCommandExecutor,
 		tarWriter tarWriter,
 		resticBackupper restic.Backupper,
 		resticSnapshotTracker *pvcSnapshotTracker,
-		blockStoreGetter BlockStoreGetter,
+		volumeSnapshotterGetter VolumeSnapshotterGetter,
 	) resourceBackupper
 }
 
@@ -57,26 +58,24 @@ func (f *defaultResourceBackupperFactory) newResourceBackupper(
 	backupRequest *Request,
 	dynamicFactory client.DynamicFactory,
 	discoveryHelper discovery.Helper,
-	backedUpItems map[itemKey]struct{},
 	cohabitatingResources map[string]*cohabitatingResource,
 	podCommandExecutor podexec.PodCommandExecutor,
 	tarWriter tarWriter,
 	resticBackupper restic.Backupper,
 	resticSnapshotTracker *pvcSnapshotTracker,
-	blockStoreGetter BlockStoreGetter,
+	volumeSnapshotterGetter VolumeSnapshotterGetter,
 ) resourceBackupper {
 	return &defaultResourceBackupper{
-		log:                   log,
-		backupRequest:         backupRequest,
-		dynamicFactory:        dynamicFactory,
-		discoveryHelper:       discoveryHelper,
-		backedUpItems:         backedUpItems,
-		cohabitatingResources: cohabitatingResources,
-		podCommandExecutor:    podCommandExecutor,
-		tarWriter:             tarWriter,
-		resticBackupper:       resticBackupper,
-		resticSnapshotTracker: resticSnapshotTracker,
-		blockStoreGetter:      blockStoreGetter,
+		log:                     log,
+		backupRequest:           backupRequest,
+		dynamicFactory:          dynamicFactory,
+		discoveryHelper:         discoveryHelper,
+		cohabitatingResources:   cohabitatingResources,
+		podCommandExecutor:      podCommandExecutor,
+		tarWriter:               tarWriter,
+		resticBackupper:         resticBackupper,
+		resticSnapshotTracker:   resticSnapshotTracker,
+		volumeSnapshotterGetter: volumeSnapshotterGetter,
 
 		itemBackupperFactory: &defaultItemBackupperFactory{},
 	}
@@ -87,37 +86,30 @@ type resourceBackupper interface {
 }
 
 type defaultResourceBackupper struct {
-	log                   logrus.FieldLogger
-	backupRequest         *Request
-	dynamicFactory        client.DynamicFactory
-	discoveryHelper       discovery.Helper
-	backedUpItems         map[itemKey]struct{}
-	cohabitatingResources map[string]*cohabitatingResource
-	podCommandExecutor    podexec.PodCommandExecutor
-	tarWriter             tarWriter
-	resticBackupper       restic.Backupper
-	resticSnapshotTracker *pvcSnapshotTracker
-	itemBackupperFactory  itemBackupperFactory
-	blockStoreGetter      BlockStoreGetter
+	log                     logrus.FieldLogger
+	backupRequest           *Request
+	dynamicFactory          client.DynamicFactory
+	discoveryHelper         discovery.Helper
+	cohabitatingResources   map[string]*cohabitatingResource
+	podCommandExecutor      podexec.PodCommandExecutor
+	tarWriter               tarWriter
+	resticBackupper         restic.Backupper
+	resticSnapshotTracker   *pvcSnapshotTracker
+	itemBackupperFactory    itemBackupperFactory
+	volumeSnapshotterGetter VolumeSnapshotterGetter
 }
 
 // backupResource backs up all the objects for a given group-version-resource.
-func (rb *defaultResourceBackupper) backupResource(
-	group *metav1.APIResourceList,
-	resource metav1.APIResource,
-) error {
-	var errs []error
+func (rb *defaultResourceBackupper) backupResource(group *metav1.APIResourceList, resource metav1.APIResource) error {
+	log := rb.log.WithField("resource", resource.Name)
+
+	log.Info("Backing up resource")
 
 	gv, err := schema.ParseGroupVersion(group.GroupVersion)
 	if err != nil {
 		return errors.Wrapf(err, "error parsing GroupVersion %s", group.GroupVersion)
 	}
 	gr := schema.GroupResource{Group: gv.Group, Resource: resource.Name}
-	grString := gr.String()
-
-	log := rb.log.WithField("groupResource", grString)
-
-	log.Info("Evaluating resource")
 
 	clusterScoped := !resource.Namespaced
 
@@ -142,8 +134,8 @@ func (rb *defaultResourceBackupper) backupResource(
 		}
 	}
 
-	if !rb.backupRequest.ResourceIncludesExcludes.ShouldInclude(grString) {
-		log.Infof("Resource is excluded")
+	if !rb.backupRequest.ResourceIncludesExcludes.ShouldInclude(gr.String()) {
+		log.Infof("Skipping resource because it's excluded")
 		return nil
 	}
 
@@ -162,14 +154,13 @@ func (rb *defaultResourceBackupper) backupResource(
 
 	itemBackupper := rb.itemBackupperFactory.newItemBackupper(
 		rb.backupRequest,
-		rb.backedUpItems,
 		rb.podCommandExecutor,
 		rb.tarWriter,
 		rb.dynamicFactory,
 		rb.discoveryHelper,
 		rb.resticBackupper,
 		rb.resticSnapshotTracker,
-		rb.blockStoreGetter,
+		rb.volumeSnapshotterGetter,
 	)
 
 	namespacesToList := getNamespacesToList(rb.backupRequest.NamespaceIncludesExcludes)
@@ -178,38 +169,39 @@ func (rb *defaultResourceBackupper) backupResource(
 	if gr == kuberesource.Namespaces && namespacesToList[0] != "" {
 		resourceClient, err := rb.dynamicFactory.ClientForGroupVersionResource(gv, resource, "")
 		if err != nil {
-			return err
+			log.WithError(err).Error("Error getting dynamic client")
+		} else {
+			var labelSelector labels.Selector
+			if rb.backupRequest.Spec.LabelSelector != nil {
+				labelSelector, err = metav1.LabelSelectorAsSelector(rb.backupRequest.Spec.LabelSelector)
+				if err != nil {
+					// This should never happen...
+					return errors.Wrap(err, "invalid label selector")
+				}
+			}
+
+			for _, ns := range namespacesToList {
+				log = log.WithField("namespace", ns)
+				log.Info("Getting namespace")
+				unstructured, err := resourceClient.Get(ns, metav1.GetOptions{})
+				if err != nil {
+					log.WithError(errors.WithStack(err)).Error("Error getting namespace")
+					continue
+				}
+
+				labels := labels.Set(unstructured.GetLabels())
+				if labelSelector != nil && !labelSelector.Matches(labels) {
+					log.Info("Skipping namespace because it does not match the backup's label selector")
+					continue
+				}
+
+				if _, err := itemBackupper.backupItem(log, unstructured, gr); err != nil {
+					log.WithError(errors.WithStack(err)).Error("Error backing up namespace")
+				}
+			}
+
+			return nil
 		}
-
-		var labelSelector labels.Selector
-		if rb.backupRequest.Spec.LabelSelector != nil {
-			labelSelector, err = metav1.LabelSelectorAsSelector(rb.backupRequest.Spec.LabelSelector)
-			if err != nil {
-				// This should never happen...
-				return errors.Wrap(err, "invalid label selector")
-			}
-		}
-
-		for _, ns := range namespacesToList {
-			log.WithField("namespace", ns).Info("Getting namespace")
-			unstructured, err := resourceClient.Get(ns, metav1.GetOptions{})
-			if err != nil {
-				errs = append(errs, errors.Wrap(err, "error getting namespace"))
-				continue
-			}
-
-			labels := labels.Set(unstructured.GetLabels())
-			if labelSelector != nil && !labelSelector.Matches(labels) {
-				log.WithField("name", unstructured.GetName()).Info("skipping item because it does not match the backup's label selector")
-				continue
-			}
-
-			if err := itemBackupper.backupItem(log, unstructured, gr); err != nil {
-				errs = append(errs, err)
-			}
-		}
-
-		return kuberrs.NewAggregate(errs)
 	}
 
 	// If we get here, we're backing up something other than namespaces
@@ -217,10 +209,14 @@ func (rb *defaultResourceBackupper) backupResource(
 		namespacesToList = []string{""}
 	}
 
+	backedUpItem := false
 	for _, namespace := range namespacesToList {
+		log = log.WithField("namespace", namespace)
+
 		resourceClient, err := rb.dynamicFactory.ClientForGroupVersionResource(gv, resource, namespace)
 		if err != nil {
-			return err
+			log.WithError(err).Error("Error getting dynamic client")
+			continue
 		}
 
 		var labelSelector string
@@ -228,44 +224,107 @@ func (rb *defaultResourceBackupper) backupResource(
 			labelSelector = metav1.FormatLabelSelector(selector)
 		}
 
-		log.WithField("namespace", namespace).Info("Listing items")
+		log.Info("Listing items")
 		unstructuredList, err := resourceClient.List(metav1.ListOptions{LabelSelector: labelSelector})
 		if err != nil {
-			return errors.WithStack(err)
+			log.WithError(errors.WithStack(err)).Error("Error listing items")
+			continue
 		}
 
 		// do the backup
 		items, err := meta.ExtractList(unstructuredList)
 		if err != nil {
-			return errors.WithStack(err)
+			log.WithError(errors.WithStack(err)).Error("Error extracting list")
+			continue
 		}
 
-		log.WithField("namespace", namespace).Infof("Retrieved %d items", len(items))
+		log.Infof("Retrieved %d items", len(items))
+
 		for _, item := range items {
 			unstructured, ok := item.(runtime.Unstructured)
 			if !ok {
-				errs = append(errs, errors.Errorf("unexpected type %T", item))
+				log.Errorf("Unexpected type %T", item)
 				continue
 			}
-
-			metadata, err := meta.Accessor(unstructured)
-			if err != nil {
-				errs = append(errs, errors.Wrapf(err, "unable to get a metadata accessor"))
-				continue
-			}
-
-			if gr == kuberesource.Namespaces && !rb.backupRequest.NamespaceIncludesExcludes.ShouldInclude(metadata.GetName()) {
-				log.WithField("name", metadata.GetName()).Info("skipping namespace because it is excluded")
-				continue
-			}
-
-			if err := itemBackupper.backupItem(log, unstructured, gr); err != nil {
-				errs = append(errs, err)
+			if rb.backupItem(log, gr, itemBackupper, unstructured) {
+				backedUpItem = true
 			}
 		}
 	}
 
-	return kuberrs.NewAggregate(errs)
+	// back up CRD for resource if found. We should only need to do this if we've backed up at least
+	// one item and IncludeClusterResources is nil. If IncludeClusterResources is false
+	// we don't want to back it up, and if it's true it will already be included.
+	if backedUpItem && rb.backupRequest.Spec.IncludeClusterResources == nil {
+		rb.backupCRD(log, gr, itemBackupper)
+	}
+
+	return nil
+}
+
+func (rb *defaultResourceBackupper) backupItem(
+	log logrus.FieldLogger,
+	gr schema.GroupResource,
+	itemBackupper ItemBackupper,
+	unstructured runtime.Unstructured,
+) bool {
+	metadata, err := meta.Accessor(unstructured)
+	if err != nil {
+		log.WithError(errors.WithStack(err)).Error("Error getting a metadata accessor")
+		return false
+	}
+
+	if gr == kuberesource.Namespaces && !rb.backupRequest.NamespaceIncludesExcludes.ShouldInclude(metadata.GetName()) {
+		log.WithField("name", metadata.GetName()).Info("Skipping namespace because it's excluded")
+		return false
+	}
+
+	backedUpItem, err := itemBackupper.backupItem(log, unstructured, gr)
+	if aggregate, ok := err.(kubeerrs.Aggregate); ok {
+		log.WithField("name", metadata.GetName()).Infof("%d errors encountered backup up item", len(aggregate.Errors()))
+		// log each error separately so we get error location info in the log, and an
+		// accurate count of errors
+		for _, err = range aggregate.Errors() {
+			log.WithError(err).WithField("name", metadata.GetName()).Error("Error backing up item")
+		}
+
+		return false
+	}
+	if err != nil {
+		log.WithError(err).WithField("name", metadata.GetName()).Error("Error backing up item")
+		return false
+	}
+	return backedUpItem
+}
+
+// Adds CRD to the backup if one is found corresponding to this resource
+func (rb *defaultResourceBackupper) backupCRD(
+	log logrus.FieldLogger,
+	gr schema.GroupResource,
+	itemBackupper ItemBackupper,
+) {
+	crdGr := schema.GroupResource{Group: apiextv1beta1.GroupName, Resource: "customresourcedefinitions"}
+	crdClient, err := rb.dynamicFactory.ClientForGroupVersionResource(apiextv1beta1.SchemeGroupVersion,
+		metav1.APIResource{
+			Name:       "customresourcedefinitions",
+			Namespaced: false,
+		},
+		"",
+	)
+	if err != nil {
+		log.WithError(err).Error("Error getting dynamic client for CRDs")
+		return
+	}
+
+	unstructured, err := crdClient.Get(gr.String(), metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.WithError(errors.WithStack(err)).Error("Error getting CRD")
+		}
+		return
+	}
+	log.Infof("Found associated CRD to add to backup %s", gr.String())
+	_ = rb.backupItem(log, crdGr, itemBackupper, unstructured)
 }
 
 // getNamespacesToList examines ie and resolves the includes and excludes to a full list of

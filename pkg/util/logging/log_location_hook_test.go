@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestRemoveArkPackagePrefix(t *testing.T) {
-	assert.Equal(t, "pkg/foo.go", removeArkPackagePrefix("github.com/heptio/ark/pkg/foo.go"))
-	assert.Equal(t, "github.com/heptio/ark-plugin-example/foo.go", removeArkPackagePrefix("github.com/heptio/ark-plugin-example/foo.go"))
+func TestRemoveVeleroPackagePrefix(t *testing.T) {
+	assert.Equal(t, "pkg/foo.go", removeVeleroPackagePrefix("github.com/vmware-tanzu/velero/pkg/foo.go"))
+	assert.Equal(t, "github.com/vmware-tanzu/velero-plugin-example/foo.go", removeVeleroPackagePrefix("github.com/vmware-tanzu/velero-plugin-example/foo.go"))
 }

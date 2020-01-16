@@ -1,5 +1,5 @@
 /*
-Copyright 2018 the Heptio Ark contributors.
+Copyright 2018, 2019 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 
 // BackupCommand returns a Command for running a restic backup.
 func BackupCommand(repoIdentifier, passwordFile, path string, tags map[string]string) *Command {
-	// --hostname flag is provided with a generic value because restic uses the hostname
+	// --host flag is provided with a generic value because restic uses the host
 	// to find a parent snapshot, and by default it will be the name of the daemonset pod
 	// where the `restic backup` command is run. If this pod is recreated, we want to continue
 	// taking incremental backups rather than triggering a full one due to a new pod name.
@@ -34,7 +34,7 @@ func BackupCommand(repoIdentifier, passwordFile, path string, tags map[string]st
 		PasswordFile:   passwordFile,
 		Dir:            path,
 		Args:           []string{"."},
-		ExtraFlags:     append(backupTagFlags(tags), "--hostname=ark"),
+		ExtraFlags:     append(backupTagFlags(tags), "--host=velero", "--json"),
 	}
 }
 
@@ -84,9 +84,9 @@ func InitCommand(repoIdentifier string) *Command {
 	}
 }
 
-func CheckCommand(repoIdentifier string) *Command {
+func SnapshotsCommand(repoIdentifier string) *Command {
 	return &Command{
-		Command:        "check",
+		Command:        "snapshots",
 		RepoIdentifier: repoIdentifier,
 	}
 }
@@ -103,5 +103,22 @@ func ForgetCommand(repoIdentifier, snapshotID string) *Command {
 		Command:        "forget",
 		RepoIdentifier: repoIdentifier,
 		Args:           []string{snapshotID},
+	}
+}
+
+func UnlockCommand(repoIdentifier string) *Command {
+	return &Command{
+		Command:        "unlock",
+		RepoIdentifier: repoIdentifier,
+	}
+}
+
+func StatsCommand(repoIdentifier, passwordFile, snapshotID string) *Command {
+	return &Command{
+		Command:        "stats",
+		RepoIdentifier: repoIdentifier,
+		PasswordFile:   passwordFile,
+		Args:           []string{snapshotID},
+		ExtraFlags:     []string{"--json"},
 	}
 }

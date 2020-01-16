@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,10 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/kuberesource"
-	"github.com/heptio/ark/pkg/podexec"
-	"github.com/heptio/ark/pkg/util/collections"
+	api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/kuberesource"
+	"github.com/vmware-tanzu/velero/pkg/podexec"
+	"github.com/vmware-tanzu/velero/pkg/util/collections"
 )
 
 type hookPhase string
@@ -145,10 +145,10 @@ func (h *defaultItemHookHandler) handleHooks(
 }
 
 const (
-	podBackupHookContainerAnnotationKey = "hook.backup.ark.heptio.com/container"
-	podBackupHookCommandAnnotationKey   = "hook.backup.ark.heptio.com/command"
-	podBackupHookOnErrorAnnotationKey   = "hook.backup.ark.heptio.com/on-error"
-	podBackupHookTimeoutAnnotationKey   = "hook.backup.ark.heptio.com/timeout"
+	podBackupHookContainerAnnotationKey = "hook.backup.velero.io/container"
+	podBackupHookCommandAnnotationKey   = "hook.backup.velero.io/command"
+	podBackupHookOnErrorAnnotationKey   = "hook.backup.velero.io/on-error"
+	podBackupHookTimeoutAnnotationKey   = "hook.backup.velero.io/timeout"
 )
 
 func phasedKey(phase hookPhase, key string) string {

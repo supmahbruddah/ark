@@ -1,5 +1,5 @@
 /*
-Copyright 2017 the Heptio Ark contributors.
+Copyright 2017, 2020 the Velero contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,13 +28,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	arktest "github.com/heptio/ark/pkg/util/test"
+	v1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 )
 
 func TestNewPodCommandExecutor(t *testing.T) {
@@ -82,7 +83,7 @@ func TestExecutePodCommandMissingInputs(t *testing.T) {
 		},
 		{
 			name:         "container not found",
-			item:         arktest.UnstructuredOrDie(`{"kind":"Pod","spec":{"containers":[{"name":"foo"}]}}`).Object,
+			item:         velerotest.UnstructuredOrDie(`{"kind":"Pod","spec":{"containers":[{"name":"foo"}]}}`).Object,
 			podNamespace: "ns",
 			podName:      "pod",
 			hookName:     "hook",
@@ -92,7 +93,7 @@ func TestExecutePodCommandMissingInputs(t *testing.T) {
 		},
 		{
 			name:         "command missing",
-			item:         arktest.UnstructuredOrDie(`{"kind":"Pod","spec":{"containers":[{"name":"foo"}]}}`).Object,
+			item:         velerotest.UnstructuredOrDie(`{"kind":"Pod","spec":{"containers":[{"name":"foo"}]}}`).Object,
 			podNamespace: "ns",
 			podName:      "pod",
 			hookName:     "hook",
@@ -105,7 +106,7 @@ func TestExecutePodCommandMissingInputs(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			e := &defaultPodCommandExecutor{}
-			err := e.ExecutePodCommand(arktest.NewLogger(), test.item, test.podNamespace, test.podName, test.hookName, test.hook)
+			err := e.ExecutePodCommand(velerotest.NewLogger(), test.item, test.podNamespace, test.podName, test.hookName, test.hook)
 			assert.Error(t, err)
 		})
 	}
@@ -161,7 +162,7 @@ func TestExecutePodCommand(t *testing.T) {
 				Timeout:   metav1.Duration{Duration: test.timeout},
 			}
 
-			pod, err := arktest.GetAsMap(`
+			pod, err := velerotest.GetAsMap(`
 {
 	"metadata": {
 		"namespace": "namespace",
@@ -187,11 +188,10 @@ func TestExecutePodCommand(t *testing.T) {
 			podCommandExecutor.streamExecutorFactory = streamExecutorFactory
 
 			baseUrl, _ := url.Parse("https://some.server")
-			contentConfig := rest.ContentConfig{
-				GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"},
+			contentConfig := rest.ClientContentConfig{
+				GroupVersion: schema.GroupVersion{Group: "", Version: "v1"},
 			}
-			postRequest := rest.NewRequest(nil, "POST", baseUrl, "/api/v1", contentConfig, rest.Serializers{}, nil, nil, 0)
-			poster.On("Post").Return(postRequest)
+			poster.On("Post").Return(rest.NewRequestWithClient(baseUrl, "/api/v1", contentConfig, nil))
 
 			streamExecutor := &mockStreamExecutor{}
 			defer streamExecutor.AssertExpectations(t)
@@ -209,7 +209,7 @@ func TestExecutePodCommand(t *testing.T) {
 			}
 			streamExecutor.On("Stream", expectedStreamOptions).Return(test.hookError)
 
-			err = podCommandExecutor.ExecutePodCommand(arktest.NewLogger(), pod, "namespace", "name", "hookName", &hook)
+			err = podCommandExecutor.ExecutePodCommand(velerotest.NewLogger(), pod, "namespace", "name", "hookName", &hook)
 			if test.expectedError != "" {
 				assert.EqualError(t, err, test.expectedError)
 				return
@@ -221,11 +221,11 @@ func TestExecutePodCommand(t *testing.T) {
 }
 
 func TestEnsureContainerExists(t *testing.T) {
-	pod := map[string]interface{}{
-		"spec": map[string]interface{}{
-			"containers": []interface{}{
-				map[string]interface{}{
-					"name": "foo",
+	pod := &corev1api.Pod{
+		Spec: corev1api.PodSpec{
+			Containers: []corev1api.Container{
+				{
+					Name: "foo",
 				},
 			},
 		},
